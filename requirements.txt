@@ -1,4 +1,3 @@
-text
 Flask==2.3.3
 psycopg2-binary==2.9.9
 pandas==2.1.0
