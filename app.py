@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash, send_file, jsonify
-import sqlite3
 import os
 from datetime import datetime, timedelta
 import hashlib
@@ -9,18 +8,268 @@ import pandas as pd
 from io import BytesIO
 import shutil
 from collections import defaultdict
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from urllib.parse import urlparse
+import sys
 
 app = Flask(__name__)
 app.secret_key = 'tipaza_secret_key_2026_v3'
 app.permanent_session_lifetime = timedelta(minutes=30)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_NAME = os.path.join(BASE_DIR, "tipaza_inventory.db")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 
 os.makedirs(os.path.join(BASE_DIR, 'static'), exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
+# -------------------- DATABASE CONNECTION --------------------
+def get_db_url():
+    """الحصول على رابط قاعدة البيانات من متغيرات البيئة"""
+    database_url = os.environ.get('DATABASE_URL')
+    if not database_url:
+        # استخدام الرابط المحلي للتجربة
+        database_url = "postgresql://postgres:Brahkingdz1134@db.ozrbnxfabnuhxpitgbrt.supabase.co:5432/postgres"
+        print("⚠️ DATABASE_URL not set, using default Supabase URL")
+    return database_url
+
+def get_db_connection():
+    """إنشاء اتصال بقاعدة البيانات"""
+    url = get_db_url()
+    try:
+        conn = psycopg2.connect(url)
+        return conn
+    except Exception as e:
+        print(f"❌ Database connection error: {e}")
+        return None
+
+def init_db():
+    """إنشاء الجداول إذا لم تكن موجودة"""
+    conn = get_db_connection()
+    if not conn:
+        print("❌ Could not connect to database")
+        return
+    
+    cur = conn.cursor()
+    
+    # إنشاء الجداول
+    tables = [
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL,
+            theme TEXT DEFAULT 'light',
+            full_name TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS inventory (
+            id SERIAL PRIMARY KEY,
+            item_name TEXT UNIQUE NOT NULL,
+            quantity INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            inventory_num TEXT,
+            min_stock INTEGER DEFAULT 5,
+            unit TEXT DEFAULT 'قطعة',
+            price REAL DEFAULT 0,
+            last_updated TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS discharges (
+            id SERIAL PRIMARY KEY,
+            item_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            receiver_id INTEGER,
+            user_charged TEXT,
+            date_time TEXT,
+            category TEXT,
+            inventory_num TEXT,
+            notes TEXT,
+            decharge_number TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS beneficiaries (
+            id SERIAL PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            grade TEXT,
+            structure TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS general_inventory (
+            id SERIAL PRIMARY KEY,
+            ordre_num TEXT,
+            inventory_num TEXT UNIQUE,
+            designation TEXT,
+            bureau_num TEXT,
+            observation TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS maintenance_equipment (
+            id SERIAL PRIMARY KEY,
+            item_name TEXT,
+            item_type TEXT,
+            inventory_num TEXT UNIQUE,
+            assigned_to TEXT,
+            status TEXT DEFAULT 'available',
+            created_at TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS maintenance_logs (
+            id SERIAL PRIMARY KEY,
+            equipment_id INTEGER,
+            item_name TEXT,
+            inventory_num TEXT,
+            sent_date TEXT,
+            repair_shop TEXT,
+            issue_description TEXT,
+            expected_return_date TEXT,
+            actual_return_date TEXT,
+            repair_cost REAL DEFAULT 0,
+            notes TEXT,
+            status TEXT DEFAULT 'sent',
+            decharge_number TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            contact TEXT,
+            address TEXT,
+            created_at TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS purchases (
+            id SERIAL PRIMARY KEY,
+            supplier_id INTEGER,
+            purchase_date TEXT,
+            item_name TEXT,
+            quantity REAL,
+            unit_price REAL,
+            total_price REAL,
+            notes TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            id SERIAL PRIMARY KEY,
+            supplier_id INTEGER,
+            payment_date TEXT,
+            amount REAL,
+            payment_method TEXT,
+            notes TEXT,
+            created_at TEXT,
+            FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
+        )
+        """
+    ]
+    
+    for table_sql in tables:
+        try:
+            cur.execute(table_sql)
+        except Exception as e:
+            print(f"⚠️ Error creating table: {e}")
+    
+    # إضافة مستخدم افتراضي (admin / 1234)
+    try:
+        cur.execute("""
+            INSERT INTO users (username, password, role, theme, full_name) 
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (username) DO NOTHING
+        """, ('admin', hash_password('1234'), 'مدير', 'light', 'مدير النظام'))
+    except Exception as e:
+        print(f"⚠️ Error adding default user: {e}")
+    
+    # إضافة مستفيدين افتراضيين
+    try:
+        cur.execute("SELECT COUNT(*) FROM beneficiaries")
+        count = cur.fetchone()[0]
+        if count == 0:
+            beneficiaries = [
+                ('أحمد علي', 'مدير', 'الإدارة'),
+                ('كريمة بن سالم', 'رئيسة قسم', 'الموارد البشرية'),
+                ('محمد لمين', 'موظف', 'التقني')
+            ]
+            for name, grade, structure in beneficiaries:
+                cur.execute("INSERT INTO beneficiaries (full_name, grade, structure) VALUES (%s, %s, %s)", (name, grade, structure))
+    except Exception as e:
+        print(f"⚠️ Error adding default beneficiaries: {e}")
+    
+    # إضافة موردين افتراضيين
+    try:
+        cur.execute("SELECT COUNT(*) FROM suppliers")
+        count = cur.fetchone()[0]
+        if count == 0:
+            suppliers = ['بودومة عمر', 'ولد ضي الله', 'sbi', 'مورد 4', 'مورد 5']
+            for name in suppliers:
+                cur.execute("INSERT INTO suppliers (name, contact, address, created_at) VALUES (%s, %s, %s, %s)", 
+                           (name, '', '', datetime.now().isoformat()))
+    except Exception as e:
+        print(f"⚠️ Error adding default suppliers: {e}")
+    
+    # إضافة عناصر افتراضية للجرد العام
+    try:
+        cur.execute("SELECT COUNT(*) FROM general_inventory")
+        count = cur.fetchone()[0]
+        if count == 0:
+            items = [
+                ('1', '26-2015', 'Bureau + bibliothèque', '6', ''),
+                ('2', '145-2009', 'Bureau marron avec retour', '6', ''),
+                ('3', '137-2008', 'Bureau Informatique', '6', ''),
+                ('4', '06-2023', 'Armoire métallique', '6', ''),
+                ('5', '13-2020', 'Clapet métallique 10 cases', '6', ''),
+                ('6', '12-2015', 'chaise opérateur', '6', ''),
+                ('7', '20-2015', 'chaise opérateur', '6', ''),
+                ('8', '', 'Chaise visiteور', '6', '')
+            ]
+            for ordre, inv_num, desig, bureau, obs in items:
+                cur.execute("""
+                    INSERT INTO general_inventory (ordre_num, inventory_num, designation, bureau_num, observation, created_at, updated_at) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (ordre, inv_num, desig, bureau, obs, datetime.now().isoformat(), datetime.now().isoformat()))
+    except Exception as e:
+        print(f"⚠️ Error adding default general inventory: {e}")
+    
+    # إضافة معدات صيانة افتراضية
+    try:
+        cur.execute("SELECT COUNT(*) FROM maintenance_equipment")
+        count = cur.fetchone()[0]
+        if count == 0:
+            equipments = [
+                ('طابعة HP', 'طابعة', 'PR-001', 'أحمد علي', 'available'),
+                ('آلة تصوير كانون', 'آلة تصوير', 'PH-002', 'كريمة بن سالم', 'available'),
+                ('حاسوب ديل', 'حاسوب', 'PC-003', 'محمد لمين', 'available')
+            ]
+            for name, typ, inv, assigned, status in equipments:
+                cur.execute("""
+                    INSERT INTO maintenance_equipment (item_name, item_type, inventory_num, assigned_to, status, created_at) 
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (name, typ, inv, assigned, status, datetime.now().isoformat()))
+    except Exception as e:
+        print(f"⚠️ Error adding default equipment: {e}")
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("✅ Database initialized successfully")
+
+# تهيئة قاعدة البيانات عند بدء التشغيل
+print("🔄 Initializing database...")
+init_db()
+
+# -------------------- CATEGORIES --------------------
 CATEGORIES = {
     'office': {'ar': 'قسم الأوراق واللوازم المكتبية', 'icon': '📝'},
     'it': {'ar': 'قسم الحبر ولوازم الإعلام الآلي', 'icon': '💻'},
@@ -35,142 +284,28 @@ UNITS = ['قطعة', 'متر', 'كيلو', 'لتر', 'علبة', 'كرتونة',
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, role TEXT, theme TEXT DEFAULT "light", full_name TEXT)')
-    c.execute('''CREATE TABLE IF NOT EXISTS inventory (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, item_name TEXT UNIQUE, quantity INTEGER,
-        category TEXT, inventory_num TEXT, min_stock INTEGER DEFAULT 5,
-        unit TEXT DEFAULT 'قطعة', price REAL DEFAULT 0, last_updated TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS discharges (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, item_name TEXT, quantity INTEGER,
-        receiver_id INTEGER, user_charged TEXT, date_time TEXT, category TEXT,
-        inventory_num TEXT, notes TEXT, decharge_number TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS beneficiaries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL, grade TEXT, structure TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS general_inventory (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ordre_num TEXT, inventory_num TEXT UNIQUE, designation TEXT,
-        bureau_num TEXT, observation TEXT, created_at TEXT, updated_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS maintenance_equipment (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_name TEXT, item_type TEXT, inventory_num TEXT UNIQUE,
-        assigned_to TEXT, status TEXT DEFAULT 'available', created_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS maintenance_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        equipment_id INTEGER, item_name TEXT, inventory_num TEXT,
-        sent_date TEXT, repair_shop TEXT, issue_description TEXT,
-        expected_return_date TEXT, actual_return_date TEXT,
-        repair_cost REAL DEFAULT 0, notes TEXT, status TEXT DEFAULT 'sent',
-        decharge_number TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS suppliers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-        contact TEXT, address TEXT, created_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS purchases (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, supplier_id INTEGER,
-        purchase_date TEXT, item_name TEXT, quantity REAL,
-        unit_price REAL, total_price REAL, notes TEXT,
-        created_at TEXT, updated_at TEXT,
-        FOREIGN KEY(supplier_id) REFERENCES suppliers(id))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, supplier_id INTEGER,
-        payment_date TEXT, amount REAL, payment_method TEXT,
-        notes TEXT, created_at TEXT,
-        FOREIGN KEY(supplier_id) REFERENCES suppliers(id))''')
-    
-    for tbl in ['inventory','discharges']:
-        c.execute(f"PRAGMA table_info({tbl})")
-        cols = [col[1] for col in c.fetchall()]
-        if tbl == 'inventory':
-            if 'unit' not in cols: c.execute("ALTER TABLE inventory ADD COLUMN unit TEXT DEFAULT 'قطعة'")
-            if 'price' not in cols: c.execute("ALTER TABLE inventory ADD COLUMN price REAL DEFAULT 0")
-            if 'min_stock' not in cols: c.execute("ALTER TABLE inventory ADD COLUMN min_stock INTEGER DEFAULT 5")
-            if 'last_updated' not in cols: c.execute("ALTER TABLE inventory ADD COLUMN last_updated TEXT")
-        if tbl == 'discharges':
-            if 'receiver_id' not in cols: c.execute("ALTER TABLE discharges ADD COLUMN receiver_id INTEGER")
-            if 'notes' not in cols: c.execute("ALTER TABLE discharges ADD COLUMN notes TEXT")
-            if 'decharge_number' not in cols: c.execute("ALTER TABLE discharges ADD COLUMN decharge_number TEXT")
-            
-    c.execute("PRAGMA table_info(maintenance_logs)")
-    cols = [col[1] for col in c.fetchall()]
-    if 'decharge_number' not in cols:
-        c.execute("ALTER TABLE maintenance_logs ADD COLUMN decharge_number TEXT")
-        
-    c.execute("SELECT COUNT(*) FROM users")
-    if c.fetchone()[0] == 0:
-        c.execute("INSERT INTO users (username, password, role, theme, full_name) VALUES (?,?,?,?,?)", 
-                  ('admin', hash_password('1234'), 'مدير', 'light', 'مدير النظام'))
-        c.execute("INSERT INTO users (username, password, role, theme, full_name) VALUES (?,?,?,?,?)", 
-                  ('supervisor', hash_password('1234'), 'مشرف', 'light', 'مشرف'))
-        c.execute("INSERT INTO users (username, password, role, theme, full_name) VALUES (?,?,?,?,?)", 
-                  ('user1', hash_password('0000'), 'موظف', 'light', 'موظف 1'))
-                  
-    c.execute("SELECT COUNT(*) FROM beneficiaries")
-    if c.fetchone()[0] == 0:
-        for name, grade, structure in [('أحمد علي','مدير','الإدارة'),('كريمة بن سالم','رئيسة قسم','الموارد البشرية'),('محمد لمين','موظف','التقني')]:
-            c.execute("INSERT INTO beneficiaries (full_name, grade, structure) VALUES (?,?,?)", (name, grade, structure))
-            
-    c.execute("SELECT COUNT(*) FROM general_inventory")
-    if c.fetchone()[0] == 0:
-        sample = [
-            ('1', '26-2015', 'Bureau + bibliothèque', '6', ''),
-            ('2', '145-2009', 'Bureau marron avec retour', '6', ''),
-            ('3', '137-2008', 'Bureau Informatique', '6', ''),
-            ('4', '06-2023', 'Armoire métallique', '6', ''),
-            ('5', '13-2020', 'Clapet métallique 10 cases', '6', ''),
-            ('6', '12-2015', 'chaise opérateur', '6', ''),
-            ('7', '20-2015', 'chaise opérateur', '6', ''),
-            ('8', '', 'Chaise visiteور', '6', '')
-        ]
-        for ordre, inv_num, desig, bureau, obs in sample:
-            c.execute("INSERT INTO general_inventory (ordre_num, inventory_num, designation, bureau_num, observation, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-                      (ordre, inv_num, desig, bureau, obs, datetime.now().isoformat(), datetime.now().isoformat()))
-                      
-    c.execute("SELECT COUNT(*) FROM maintenance_equipment")
-    if c.fetchone()[0] == 0:
-        equipments = [
-            ('طابعة HP', 'طابعة', 'PR-001', 'أحمد علي', 'available'),
-            ('آلة تصوير كانون', 'آلة تصوير', 'PH-002', 'كريمة بن سالم', 'available'),
-            ('حاسوب ديل', 'حاسوب', 'PC-003', 'محمد لمين', 'available')
-        ]
-        for name, typ, inv, assigned, status in equipments:
-            c.execute("INSERT INTO maintenance_equipment (item_name, item_type, inventory_num, assigned_to, status, created_at) VALUES (?,?,?,?,?,?)",
-                      (name, typ, inv, assigned, status, datetime.now().isoformat()))
-                      
-    c.execute("SELECT COUNT(*) FROM suppliers")
-    if c.fetchone()[0] == 0:
-        # الموردين التلقائيين الجدد
-        default_suppliers = [
-            'بودومة عمر',
-            'ولد ضي الله',
-            'sbi',
-            'مورد 4',
-            'مورد 5'
-        ]
-        for sup_name in default_suppliers:
-            c.execute("INSERT INTO suppliers (name, contact, address, created_at) VALUES (?,?,?,?)",
-                      (sup_name, '', '', datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-init_db()
-
+# -------------------- HELPER FUNCTIONS --------------------
 def get_last_decharge_number():
     current_year = datetime.now().year
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return None
     cur = conn.cursor()
-    cur.execute("SELECT decharge_number FROM discharges WHERE decharge_number LIKE ? ORDER BY id DESC LIMIT 1", (f"%/{current_year}",))
+    cur.execute("SELECT decharge_number FROM discharges WHERE decharge_number LIKE %s ORDER BY id DESC LIMIT 1", (f"%/{current_year}",))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     return row[0] if row else None
 
 def get_next_decharge_number_for_inventory():
     current_year = datetime.now().year
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return f"1/{current_year}"
     cur = conn.cursor()
-    cur.execute("SELECT decharge_number FROM discharges WHERE decharge_number LIKE ? ORDER BY id DESC LIMIT 1", (f"%/{current_year}",))
+    cur.execute("SELECT decharge_number FROM discharges WHERE decharge_number LIKE %s ORDER BY id DESC LIMIT 1", (f"%/{current_year}",))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     if row and row[0]:
         try:
@@ -182,111 +317,191 @@ def get_next_decharge_number_for_inventory():
 
 def get_next_decharge_number_for_maintenance():
     current_year = datetime.now().year
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return f"1/{current_year}"
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM maintenance_logs WHERE strftime('%Y', sent_date)=?", (str(current_year),))
+    cur.execute("SELECT COUNT(*) FROM maintenance_logs WHERE EXTRACT(YEAR FROM sent_date::date)=%s", (str(current_year),))
     count = cur.fetchone()[0]
+    cur.close()
     conn.close()
     return f"{count+1}/{current_year}"
 
 def get_filtered_logs(period, start, end, recipient, item):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return []
     cur = conn.cursor()
     q = """SELECT d.id, d.item_name, d.quantity, b.full_name, d.user_charged, d.date_time, d.category, d.inventory_num, d.notes
            FROM discharges d LEFT JOIN beneficiaries b ON d.receiver_id = b.id WHERE 1=1"""
     p = []
     if period == 'today':
-        q += " AND d.date_time LIKE ?"; p.append(f"{datetime.now().strftime('%Y-%m-%d')}%")
+        q += " AND d.date_time LIKE %s"; p.append(f"{datetime.now().strftime('%Y-%m-%d')}%")
     elif period == 'month':
-        q += " AND d.date_time LIKE ?"; p.append(f"{datetime.now().strftime('%Y-%m')}%")
+        q += " AND d.date_time LIKE %s"; p.append(f"{datetime.now().strftime('%Y-%m')}%")
     elif period == 'year':
-        q += " AND d.date_time LIKE ?"; p.append(f"{datetime.now().strftime('%Y')}%")
+        q += " AND d.date_time LIKE %s"; p.append(f"{datetime.now().strftime('%Y')}%")
     elif period == 'custom' and start and end:
-        q += " AND date(d.date_time) BETWEEN date(?) AND date(?)"; p.extend([start, end])
+        q += " AND d.date_time::date BETWEEN %s AND %s"; p.extend([start, end])
     if recipient:
-        q += " AND b.full_name LIKE ?"; p.append(f"%{recipient}%")
+        q += " AND b.full_name LIKE %s"; p.append(f"%{recipient}%")
     if item:
-        q += " AND d.item_name LIKE ?"; p.append(f"%{item}%")
+        q += " AND d.item_name LIKE %s"; p.append(f"%{item}%")
     q += " ORDER BY d.id DESC"
     cur.execute(q, p)
     data = cur.fetchall()
+    cur.close()
     conn.close()
     return data
 
 def get_low_stock():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
+    if not conn:
+        return []
     cur = conn.cursor()
     cur.execute("SELECT item_name, quantity, min_stock, category FROM inventory WHERE quantity <= min_stock ORDER BY quantity")
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
 def get_stats():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
+    if not conn:
+        return {}
     cur = conn.cursor()
-    total_items = cur.execute("SELECT COUNT(*) as c FROM inventory").fetchone()['c']
-    total_quantity = cur.execute("SELECT SUM(quantity) as s FROM inventory").fetchone()['s'] or 0
-    total_value = cur.execute("SELECT SUM(quantity * price) as v FROM inventory").fetchone()['v'] or 0
-    total_discharges = cur.execute("SELECT COUNT(*) as c FROM discharges").fetchone()['c']
-    low_count = cur.execute("SELECT COUNT(*) as c FROM inventory WHERE quantity <= min_stock").fetchone()['c']
-    cat_dist = cur.execute("SELECT category, COUNT(*) as c FROM inventory GROUP BY category").fetchall()
-    top_items = cur.execute("SELECT item_name, SUM(quantity) as total FROM discharges GROUP BY item_name ORDER BY total DESC LIMIT 10").fetchall()
-    ongoing_maintenance = cur.execute("SELECT COUNT(*) FROM maintenance_logs WHERE status='sent'").fetchone()[0]
-    completed_maintenance = cur.execute("SELECT COUNT(*) FROM maintenance_logs WHERE status='returned'").fetchone()[0]
-    total_repair_cost = cur.execute("SELECT SUM(repair_cost) FROM maintenance_logs WHERE status='returned'").fetchone()[0] or 0
-    total_equipment = cur.execute("SELECT COUNT(*) FROM maintenance_equipment").fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM inventory")
+    total_items = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT COALESCE(SUM(quantity), 0) FROM inventory")
+    total_quantity = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT COALESCE(SUM(quantity * price), 0) FROM inventory")
+    total_value = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT COUNT(*) FROM discharges")
+    total_discharges = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT COUNT(*) FROM inventory WHERE quantity <= min_stock")
+    low_count = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT category, COUNT(*) FROM inventory GROUP BY category")
+    cat_dist = cur.fetchall()
+    
+    cur.execute("SELECT item_name, SUM(quantity) as total FROM discharges GROUP BY item_name ORDER BY total DESC LIMIT 10")
+    top_items = cur.fetchall()
+    
+    cur.execute("SELECT COUNT(*) FROM maintenance_logs WHERE status='sent'")
+    ongoing_maintenance = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT COUNT(*) FROM maintenance_logs WHERE status='returned'")
+    completed_maintenance = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT COALESCE(SUM(repair_cost), 0) FROM maintenance_logs WHERE status='returned'")
+    total_repair_cost = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT COUNT(*) FROM maintenance_equipment")
+    total_equipment = cur.fetchone()[0] or 0
+    
+    cur.close()
     conn.close()
-    cat_data = {CATEGORIES.get(c['category'],{}).get('ar',c['category']): c['c'] for c in cat_dist}
-    top_data = [{'name': t['item_name'], 'total': t['total']} for t in top_items]
-    return {'total_items': total_items, 'total_quantity': total_quantity, 'total_value': total_value,
-            'total_discharges': total_discharges, 'low_stock_count': low_count,
-            'category_data': cat_data, 'top_items_data': top_data,
-            'ongoing_maintenance': ongoing_maintenance, 'completed_maintenance': completed_maintenance,
-            'total_repair_cost': total_repair_cost, 'total_equipment': total_equipment}
-
-def get_consumption_for_year(year):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT item_name, SUM(quantity) FROM discharges WHERE strftime('%Y', date_time)=? GROUP BY item_name", (str(year),))
-    d = {row[0]: row[1] for row in cur.fetchall()}
-    conn.close()
-    return d
-
-def get_consumption_timeline(months=12):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    result = []
-    today = datetime.now()
-    for i in range(months-1, -1, -1):
-        dt = today.replace(day=1) - timedelta(days=30*i)
-        month_str = dt.strftime("%Y-%m")
-        cur.execute("SELECT SUM(quantity) FROM discharges WHERE strftime('%Y-%m', date_time)=?", (month_str,))
-        total = cur.fetchone()[0] or 0
-        result.append({'month': month_str, 'total': total})
-    conn.close()
-    return result
+    
+    cat_data = {CATEGORIES.get(c[0], {}).get('ar', c[0]): c[1] for c in cat_dist}
+    top_data = [{'name': t[0], 'total': t[1]} for t in top_items]
+    
+    return {
+        'total_items': total_items,
+        'total_quantity': total_quantity,
+        'total_value': total_value,
+        'total_discharges': total_discharges,
+        'low_stock_count': low_count,
+        'category_data': cat_data,
+        'top_items_data': top_data,
+        'ongoing_maintenance': ongoing_maintenance,
+        'completed_maintenance': completed_maintenance,
+        'total_repair_cost': total_repair_cost,
+        'total_equipment': total_equipment
+    }
 
 def get_beneficiaries():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return []
     cur = conn.cursor()
     cur.execute("SELECT id, full_name, grade, structure FROM beneficiaries ORDER BY full_name")
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [{'id': r[0], 'full_name': r[1], 'grade': r[2], 'structure': r[3]} for r in rows]
 
 def add_beneficiary(full_name, grade='', structure=''):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return None
     cur = conn.cursor()
-    cur.execute("INSERT INTO beneficiaries (full_name, grade, structure) VALUES (?,?,?)", (full_name, grade, structure))
+    cur.execute("INSERT INTO beneficiaries (full_name, grade, structure) VALUES (%s, %s, %s) RETURNING id", (full_name, grade, structure))
+    new_id = cur.fetchone()[0]
     conn.commit()
-    new_id = cur.lastrowid
+    cur.close()
     conn.close()
     return new_id
 
+def get_next_ordre_num():
+    conn = get_db_connection()
+    if not conn:
+        return "1"
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(CAST(ordre_num AS INTEGER)) FROM general_inventory WHERE ordre_num ~ '^[0-9]+$'")
+    max_num = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return str(int(max_num)+1) if max_num else "1"
+
+def get_completed_maintenance_by_year(year=None):
+    if year is None:
+        year = datetime.now().year
+    conn = get_db_connection()
+    if not conn:
+        return []
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM maintenance_logs 
+        WHERE status='returned' AND EXTRACT(YEAR FROM actual_return_date::date)=%s
+        ORDER BY actual_return_date DESC
+    """, (str(year),))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+def backup_db():
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_filename = f"tipaza_backup_{timestamp}.sql"
+    backup_path = os.path.join(BACKUP_DIR, backup_filename)
+    
+    conn = get_db_connection()
+    if not conn:
+        return backup_path
+    
+    try:
+        import subprocess
+        url = get_db_url()
+        cmd = f"pg_dump {url} > {backup_path}"
+        subprocess.run(cmd, shell=True, check=True)
+        print(f"✅ Backup created: {backup_path}")
+    except Exception as e:
+        print(f"⚠️ Backup failed: {e}")
+        with open(backup_path, 'w') as f:
+            f.write(f"-- Backup failed: {e}")
+    
+    conn.close()
+    return backup_path
+
 def export_inventory_excel():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return BytesIO()
     df = pd.read_sql_query("SELECT id, item_name, quantity, category, inventory_num, min_stock, unit, price, last_updated FROM inventory", conn)
     conn.close()
     df.columns = ['الرقم','اسم المادة','الكمية','القسم','رقم الجرد','الحد الأدنى','الوحدة','السعر','آخر تحديث']
@@ -304,6 +519,23 @@ def export_logs_excel(discharges_data):
         df.to_excel(writer, index=False, sheet_name='سجل_العمليات')
     out.seek(0)
     return out
+
+def get_consumption_timeline(months=12):
+    conn = get_db_connection()
+    if not conn:
+        return []
+    cur = conn.cursor()
+    result = []
+    today = datetime.now()
+    for i in range(months-1, -1, -1):
+        dt = today.replace(day=1) - timedelta(days=30*i)
+        month_str = dt.strftime("%Y-%m")
+        cur.execute("SELECT COALESCE(SUM(quantity), 0) FROM discharges WHERE date_time LIKE %s", (month_str + '%',))
+        total = cur.fetchone()[0] or 0
+        result.append({'month': month_str, 'total': total})
+    cur.close()
+    conn.close()
+    return result
 
 def import_inventory_excel(file):
     try:
@@ -327,7 +559,9 @@ def import_inventory_excel(file):
         if rename_dict:
             df = df.rename(columns=rename_dict)
         
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
+        if not conn:
+            return False, "خطأ في الاتصال بقاعدة البيانات"
         cur = conn.cursor()
         for _, row in df.iterrows():
             name = None
@@ -358,50 +592,21 @@ def import_inventory_excel(file):
             if 'price' in df.columns and pd.notna(row['price']):
                 try: price = float(row['price'])
                 except: pass
-            cur.execute("SELECT id FROM inventory WHERE item_name=?", (name,))
+            cur.execute("SELECT id FROM inventory WHERE item_name=%s", (name,))
             if cur.fetchone():
-                cur.execute("""UPDATE inventory SET quantity=?, category=?, inventory_num=?, min_stock=?, unit=?, price=?, last_updated=?
-                               WHERE item_name=?""",
+                cur.execute("""UPDATE inventory SET quantity=%s, category=%s, inventory_num=%s, min_stock=%s, unit=%s, price=%s, last_updated=%s
+                               WHERE item_name=%s""",
                             (qty, cat, inv_num, min_stock, unit, price, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name))
             else:
                 cur.execute("""INSERT INTO inventory (item_name, quantity, category, inventory_num, min_stock, unit, price, last_updated)
-                               VALUES (?,?,?,?,?,?,?,?)""",
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                             (name, qty, cat, inv_num, min_stock, unit, price, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
+        cur.close()
         conn.close()
         return True, "تم الاستيراد بنجاح"
     except Exception as e:
         return False, str(e)
-
-def backup_db():
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_filename = f"tipaza_backup_{timestamp}.db"
-    backup_path = os.path.join(BACKUP_DIR, backup_filename)
-    shutil.copy2(DB_NAME, backup_path)
-    return backup_path
-
-def get_next_ordre_num():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT MAX(CAST(ordre_num AS INTEGER)) FROM general_inventory WHERE ordre_num GLOB '[0-9]*'")
-    max_num = cur.fetchone()[0]
-    conn.close()
-    return str(int(max_num)+1) if max_num else "1"
-
-def get_completed_maintenance_by_year(year=None):
-    if year is None:
-        year = datetime.now().year
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM maintenance_logs 
-        WHERE status='returned' AND strftime('%Y', actual_return_date)=? 
-        ORDER BY actual_return_date DESC
-    """, (str(year),))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
 
 # -------------------- HTML TEMPLATES --------------------
 BASE_HTML = '''
@@ -497,7 +702,7 @@ DASHBOARD_HTML = '''
         <div class="col-md-3"><div class="dashboard-card text-white" style="background:linear-gradient(135deg,#4facfe,#00f2fe)"><div><h2 class="mb-0">{{ stats.total_discharges }}</h2><p>عمليات السحب</p><i class="fas fa-exchange-alt fa-3x opacity-50"></i></div></div></div>
         <div class="col-md-3"><div class="dashboard-card text-white" style="background:linear-gradient(135deg,#43e97b,#38f9d7)"><div><h2 class="mb-0">{{ stats.low_stock_count }}</h2><p>مواد منخفضة</p><i class="fas fa-exclamation-triangle fa-3x opacity-50"></i></div></div></div>
     </div>
-    {% if low_stock %}<div class="alert alert-warning"><h5><i class="fas fa-exclamation-triangle"></i> تنبيه: مواد منخفضة المخزون</h5><ul>{% for i in low_stock %}<li>{{ i.item_name }} - الكمية: {{ i.quantity }} (الحد الأدنى: {{ i.min_stock }})</li>{% endfor %}</ul></div>{% endif %}
+    {% if low_stock %}<div class="alert alert-warning"><h5><i class="fas fa-exclamation-triangle"></i> تنبيه: مواد منخفضة المخزون</h5><ul>{% for i in low_stock %}<li>{{ i[0] }} - الكمية: {{ i[1] }} (الحد الأدنى: {{ i[2] }})</li>{% endfor %}</ul></div>{% endif %}
     <h4 class="mb-4">الأقسام المتاحة</h4>
     <div class="row g-4">{% for slug,cat in categories.items() %}<div class="col-md-4 col-sm-6"><a href="/section/{{ slug }}/{{ username }}" class="text-decoration-none"><div class="card h-100 p-4 text-center cat-card"><div class="display-4 mb-3">{{ cat.icon }}</div><h5 class="fw-bold">{{ cat.ar }}</h5></div></a></div>{% endfor %}</div>
 </div>
@@ -586,7 +791,7 @@ GENERAL_INV_HTML = '''
 <nav class="navbar navbar-custom"><div class="container"><span class="navbar-brand">الجرد العام</span><div><a href="/dashboard/{{ username }}" class="btn btn-outline-light btn-sm">الرئيسية</a></div></div></nav>
 <div class="container mt-4"><div class="card p-4 mb-4"><h5>إضافة عنصر جديد</h5><form method="POST" action="/add_general_item/{{ username }}" class="row g-2"><div class="col-md-2"><input type="text" name="ordre_num" class="form-control" placeholder="رقم التسلسل" readonly value="{{ next_num }}"></div><div class="col-md-2"><input type="text" name="inventory_num" class="form-control" placeholder="رقم الجرد" required></div><div class="col-md-4"><input type="text" name="designation" class="form-control" placeholder="التسمية" required></div><div class="col-md-2"><input type="text" name="bureau_num" class="form-control" placeholder="المكتب"></div><div class="col-md-2"><input type="text" name="observation" class="form-control" placeholder="ملاحظات"></div><div class="col-md-12"><button type="submit" class="btn btn-primary">إضافة</button></div></form></div>
 <div class="card p-4"><div class="d-flex justify-content-between mb-3"><h5>قائمة الممتلكات</h5><div><button class="btn btn-secondary" onclick="preparePrint()">طباعة</button></div></div><div class="row g-2 mb-3"><div class="col-md-4"><input type="text" id="filterDesignation" class="form-control" placeholder="فلتر بالتسمية"></div><div class="col-md-4"><input type="text" id="filterBureau" class="form-control" placeholder="فلتر بالمكتب"></div><div class="col-md-4"><button class="btn btn-outline-primary" onclick="filterTable()">فلترة</button></div></div>
-<div class="table-responsive"><table class="table table-bordered" id="invTable"><thead class="table-light"><tr><th>رقم التسلسل</th><th>رقم الجرد</th><th>التسمية</th><th>المكتب</th><th>ملاحظات</th><th>إجراءات</th></tr></thead><tbody>{% for item in items %}<tr><td class="align-middle">{{ item.ordre_num }}</td><td class="align-middle">{{ item.inventory_num }}</td><td class="align-middle">{{ item.designation }}</td><td class="align-middle">{{ item.bureau_num }}</td><td class="align-middle">{{ item.observation }}</td><td class="align-middle"><button class="btn btn-sm btn-info" onclick="editItem({{ item.id }},'{{ item.ordre_num }}','{{ item.inventory_num }}','{{ item.designation }}','{{ item.bureau_num }}','{{ item.observation }}')">تعديل</button><a href="/delete_general_item/{{ item.id }}/{{ username }}" class="btn btn-sm btn-danger ms-1" onclick="return confirm('حذف؟')">حذف</a></td></tr>{% endfor %}</tbody></table></div></div></div>
+<div class="table-responsive"><table class="table table-bordered" id="invTable"><thead class="table-light"><tr><th>رقم التسلسل</th><th>رقم الجرد</th><th>التسمية</th><th>المكتب</th><th>ملاحظات</th><th>إجراءات</th></tr></thead><tbody>{% for item in items %}<tr><td class="align-middle">{{ item[1] }}</td><td class="align-middle">{{ item[2] }}</td><td class="align-middle">{{ item[3] }}</td><td class="align-middle">{{ item[4] }}</td><td class="align-middle">{{ item[5] }}</td><td class="align-middle"><button class="btn btn-sm btn-info" onclick="editItem({{ item[0] }},'{{ item[1] }}','{{ item[2] }}','{{ item[3] }}','{{ item[4] }}','{{ item[5] }}')">تعديل</button><a href="/delete_general_item/{{ item[0] }}/{{ username }}" class="btn btn-sm btn-danger ms-1" onclick="return confirm('حذف؟')">حذف</a></td></tr>{% endfor %}</tbody></table></div></div></div>
 <div class="modal fade" id="employeeModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>إضافة أسماء الموظفين وشاغل المكتب</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="mb-3"><label>الموظفون (افصل بينهم بفاصلة)</label><input type="text" id="employeesList" class="form-control" placeholder="مثال: أحمد علي، كريمة بن سالم"></div><div class="mb-3"><label>شاغل المكتب</label><input type="text" id="officeOccupant" class="form-control" placeholder="اسم شاغل المكتب"></div><div class="mb-3"><label>رقم المكتب</label><input type="text" id="bureauNum" class="form-control" placeholder="مثلاً: 6"></div></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">إلغاء</button><button type="button" class="btn btn-primary" onclick="printWithFilter()">طباعة</button></div></div></div></div>
 <div class="modal fade" id="editModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>تعديل</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" id="editForm"><div class="modal-body"><input type="hidden" name="id" id="edit_id"><div class="mb-2"><label>رقم التسلسل</label><input type="text" name="ordre_num" id="edit_ordre" class="form-control" required></div><div class="mb-2"><label>رقم الجرد</label><input type="text" name="inventory_num" id="edit_inv" class="form-control" required></div><div class="mb-2"><label>التسمية</label><input type="text" name="designation" id="edit_desig" class="form-control" required></div><div class="mb-2"><label>المكتب</label><input type="text" name="bureau_num" id="edit_bureau" class="form-control"></div><div class="mb-2"><label>ملاحظات</label><input type="text" name="observation" id="edit_obs" class="form-control"></div></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">إلغاء</button><button type="submit" class="btn btn-primary">حفظ</button></div></form></div></div></div>
 <script>
@@ -639,7 +844,6 @@ GENERAL_PRINT_FILTERED_HTML = '''
     </table>
     <div class="office-occupant"><strong>Occupant du bureau :</strong> {{ office_occupant }}</div>
     
-    <!-- سطر التوقيع مع مسافات بين الأسماء و Directeur في النهاية -->
     <div class="signature-line">
         {% set employees_list = employees.split('،') if employees else [] %}
         {% for emp in employees_list %}
@@ -661,11 +865,11 @@ MAINTENANCE_HTML = '''
 <body>
 <nav class="navbar navbar-custom"><div class="container"><span class="navbar-brand">قسم الصيانة - تتبع المعدات</span><div><a href="/dashboard/{{ username }}" class="btn btn-outline-light btn-sm">الرئيسية</a><a href="/print_completed_maintenance/{{ username }}" class="btn btn-outline-light btn-sm ms-2" target="_blank">📄 تقرير الصيانة المكتملة</a></div></div></nav>
 <div class="container mt-4"><div class="card p-4 mb-4"><h5>إضافة معدات جديدة</h5><form method="POST" action="/add_equipment/{{ username }}" class="row g-2"><div class="col-md-3"><input type="text" name="item_name" class="form-control" placeholder="اسم المعدة" required></div><div class="col-md-2"><input type="text" name="item_type" class="form-control" placeholder="النوع" required></div><div class="col-md-2"><input type="text" name="inventory_num" class="form-control" placeholder="رقم الجرد" required></div><div class="col-md-3"><input type="text" name="assigned_to" class="form-control" placeholder="الموظف المكلف" required></div><div class="col-md-2"><button type="submit" class="btn btn-primary">إضافة</button></div></form></div>
-<div class="card p-4"><h5>المعدات المسجلة</h5><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>اسم المعدة</th><th>النوع</th><th>رقم الجرد</th><th>الموظف المكلف</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>{% for eq in equipment %}<tr><td class="align-middle">{{ eq.item_name }}</td><td class="align-middle">{{ eq.item_type }}</td><td class="align-middle">{{ eq.inventory_num }}</td><td class="align-middle">{{ eq.assigned_to }}</td><td class="align-middle">{% if eq.status == 'available' %}متاحة{% else %}قيد الصيانة{% endif %}</td><td class="align-middle"><button class="btn btn-sm btn-warning" onclick="editEquipment({{ eq.id }},'{{ eq.item_name }}','{{ eq.item_type }}','{{ eq.inventory_num }}','{{ eq.assigned_to }}')">تعديل</button><a href="/delete_equipment/{{ eq.id }}/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف المعدة؟')">حذف</a>{% if eq.status == 'available' %}<button class="btn btn-sm btn-primary mt-1" onclick="sendToMaintenance({{ eq.id }},'{{ eq.item_name }}','{{ eq.inventory_num }}')">إرسال للصيانة</button>{% endif %}</td></tr>{% else %}<tr><td colspan="6">لا توجد معدات مسجلة</td>{% endfor %}</tbody></table></div></div>
-<div class="card p-4 mt-4"><div class="d-flex justify-content-between"><h5>المعدات تحت الصيانة حالياً</h5><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#multiMaintenanceModal">📄 وصل صيانة متعدد</button></div><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>المادة</th><th>رقم الجرد</th><th>تاريخ الإرسال</th><th>المصلح</th><th>الإجراء</th></tr></thead><tbody>{% for log in ongoing %}<tr><td class="align-middle">{{ log.item_name }}</td><td class="align-middle">{{ log.inventory_num }}</td><td class="align-middle">{{ log.sent_date }}</td><td class="align-middle">{{ log.repair_shop }}</td><td class="align-middle"><button class="btn btn-sm btn-success" onclick="returnFromMaintenance({{ log.id }},'{{ log.item_name }}')">استلام</button><a href="/print_maintenance_slip/{{ log.id }}/{{ username }}" target="_blank" class="btn btn-sm btn-info">وصل الصيانة</a><a href="/maintenance_decharge_form/{{ log.id }}/{{ username }}" class="btn btn-sm btn-secondary ms-1">وصل التسليم</a><a href="/delete_maintenance_log/{{ log.id }}/ongoing/{{ username }}" class="btn btn-sm btn-danger ms-1" onclick="return confirm('حذف هذا السجل؟')">حذف</a></td></tr>{% else %}<tr><td colspan="5">لا توجد عمليات صيانة جارية</td>{% endfor %}</tbody></table></div></div>
-<div class="card p-4 mt-4"><h5>الصيانة المكتملة</h5><div class="table-responsive"><table class="table table-sm table-bordered"><thead class="table-light"><tr><th>المادة</th><th>رقم الجرد</th><th>تاريخ الإرسال</th><th>تاريخ العودة</th><th>التكلفة</th><th>إجراءات</th></tr></thead><tbody>{% for log in completed %}<tr><td class="align-middle">{{ log.item_name }}</td><td class="align-middle">{{ log.inventory_num }}</td><td class="align-middle">{{ log.sent_date }}</td><td class="align-middle">{{ log.actual_return_date }}</td><td class="align-middle">{{ log.repair_cost }} دج</td><td class="align-middle"><a href="/delete_maintenance_log/{{ log.id }}/completed/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف السجل؟')">حذف</a></td></td>{% else %}<tr><td colspan="6" class="text-center">لا توجد صيانة مكتملة</td>{% endfor %}</tbody></table></div></div></div>
+<div class="card p-4"><h5>المعدات المسجلة</h5><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>اسم المعدة</th><th>النوع</th><th>رقم الجرد</th><th>الموظف المكلف</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>{% for eq in equipment %}<tr><td class="align-middle">{{ eq[1] }}</td><td class="align-middle">{{ eq[2] }}</td><td class="align-middle">{{ eq[3] }}</td><td class="align-middle">{{ eq[4] }}</td><td class="align-middle">{% if eq[5] == 'available' %}متاحة{% else %}قيد الصيانة{% endif %}</td><td class="align-middle"><button class="btn btn-sm btn-warning" onclick="editEquipment({{ eq[0] }},'{{ eq[1] }}','{{ eq[2] }}','{{ eq[3] }}','{{ eq[4] }}')">تعديل</button><a href="/delete_equipment/{{ eq[0] }}/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف المعدة؟')">حذف</a>{% if eq[5] == 'available' %}<button class="btn btn-sm btn-primary mt-1" onclick="sendToMaintenance({{ eq[0] }},'{{ eq[1] }}','{{ eq[3] }}')">إرسال للصيانة</button>{% endif %}</td></tr>{% else %}<tr><td colspan="6">لا توجد معدات مسجلة</td>{% endfor %}</tbody></table></div></div>
+<div class="card p-4 mt-4"><div class="d-flex justify-content-between"><h5>المعدات تحت الصيانة حالياً</h5><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#multiMaintenanceModal">📄 وصل صيانة متعدد</button></div><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>المادة</th><th>رقم الجرد</th><th>تاريخ الإرسال</th><th>المصلح</th><th>الإجراء</th></tr></thead><tbody>{% for log in ongoing %}<tr><td class="align-middle">{{ log[2] }}</td><td class="align-middle">{{ log[3] }}</td><td class="align-middle">{{ log[4] }}</td><td class="align-middle">{{ log[5] }}</td><td class="align-middle"><button class="btn btn-sm btn-success" onclick="returnFromMaintenance({{ log[0] }},'{{ log[2] }}')">استلام</button><a href="/print_maintenance_slip/{{ log[0] }}/{{ username }}" target="_blank" class="btn btn-sm btn-info">وصل الصيانة</a><a href="/maintenance_decharge_form/{{ log[0] }}/{{ username }}" class="btn btn-sm btn-secondary ms-1">وصل التسليم</a><a href="/delete_maintenance_log/{{ log[0] }}/ongoing/{{ username }}" class="btn btn-sm btn-danger ms-1" onclick="return confirm('حذف هذا السجل؟')">حذف</a></td></tr>{% else %}<tr><td colspan="5">لا توجد عمليات صيانة جارية</td>{% endfor %}</tbody></table></div></div>
+<div class="card p-4 mt-4"><h5>الصيانة المكتملة</h5><div class="table-responsive"><table class="table table-sm table-bordered"><thead class="table-light"><tr><th>المادة</th><th>رقم الجرد</th><th>تاريخ الإرسال</th><th>تاريخ العودة</th><th>التكلفة</th><th>إجراءات</th></tr></thead><tbody>{% for log in completed %}<tr><td class="align-middle">{{ log[2] }}</td><td class="align-middle">{{ log[3] }}</td><td class="align-middle">{{ log[4] }}</td><td class="align-middle">{{ log[7] }}</td><td class="align-middle">{{ log[8] }} دج</td><td class="align-middle"><a href="/delete_maintenance_log/{{ log[0] }}/completed/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف السجل؟')">حذف</a></td></td>{% else %}<tr><td colspan="6" class="text-center">لا توجد صيانة مكتملة</td>{% endfor %}</tbody></table></div></div></div>
 <div class="modal fade" id="sendModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>إرسال للصيانة الخارجية</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" id="sendForm"><div class="modal-body"><input type="hidden" name="equipment_id" id="send_equip_id"><div class="mb-2"><label>المادة</label><input type="text" id="send_item_name" class="form-control" readonly></div><div class="mb-2"><label>رقم الجرد</label><input type="text" id="send_inv_num" class="form-control" readonly></div><div class="mb-2"><label>المصلح الخارجي</label><input type="text" name="repair_shop" class="form-control" required></div><div class="mb-2"><label>وصف العطل</label><textarea name="issue_description" class="form-control" rows="2" required></textarea></div><div class="mb-2"><label>تاريخ العودة المتوقع (اختياري)</label><input type="date" name="expected_return_date" class="form-control"></div></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">إلغاء</button><button type="submit" class="btn btn-primary">إرسال</button></div></form></div></div></div>
-<div class="modal fade" id="multiMaintenanceModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5>وصل صيانة متعدد</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" action="/send_multi_equipment_to_maintenance/{{ username }}"><div class="modal-body"><div class="mb-3"><label>المصلح الخارجي</label><input type="text" name="repair_shop" class="form-control" required></div><div class="mb-3"><label>وصف العطل (عام)</label><textarea name="issue_description" class="form-control" rows="2" required></textarea></div><div class="mb-3"><label>تاريخ العودة المتوقع (اختياري)</label><input type="date" name="expected_return_date" class="form-control"></div><h6>اختر المعدات المراد إرسالها:</h6><div class="table-responsive"><table class="table table-bordered"><thead><tr><th><input type="checkbox" id="selectAllMulti"> الكل</th><th>المعدة</th><th>رقم الجرد</th></tr></thead><tbody>{% for eq in equipment if eq.status == 'available' %}<tr><td><input type="checkbox" name="equipment_ids" value="{{ eq.id }}" class="multi-checkbox"></td><td>{{ eq.item_name }}</td><td>{{ eq.inventory_num }}</td></tr>{% else %}<tr><td colspan="3">لا توجد معدات متاحة</td>{% endfor %}</tbody></table></div></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">إلغاء</button><button type="submit" class="btn btn-primary">إنشاء وصل وإرسال</button></div></form></div></div></div>
+<div class="modal fade" id="multiMaintenanceModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5>وصل صيانة متعدد</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" action="/send_multi_equipment_to_maintenance/{{ username }}"><div class="modal-body"><div class="mb-3"><label>المصلح الخارجي</label><input type="text" name="repair_shop" class="form-control" required></div><div class="mb-3"><label>وصف العطل (عام)</label><textarea name="issue_description" class="form-control" rows="2" required></textarea></div><div class="mb-3"><label>تاريخ العودة المتوقع (اختياري)</label><input type="date" name="expected_return_date" class="form-control"></div><h6>اختر المعدات المراد إرسالها:</h6><div class="table-responsive"><table class="table table-bordered"><thead><tr><th><input type="checkbox" id="selectAllMulti"> الكل</th><th>المعدة</th><th>رقم الجرد</th></tr></thead><tbody>{% for eq in equipment if eq[5] == 'available' %}<tr><td><input type="checkbox" name="equipment_ids" value="{{ eq[0] }}" class="multi-checkbox"></td><td>{{ eq[1] }}</td><td>{{ eq[3] }}</td></tr>{% else %}<tr><td colspan="3">لا توجد معدات متاحة</td>{% endfor %}</tbody></table></div></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">إلغاء</button><button type="submit" class="btn btn-primary">إنشاء وصل وإرسال</button></div></form></div></div></div>
 <div class="modal fade" id="returnModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>استلام من الصيانة</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" id="returnForm"><div class="modal-body"><input type="hidden" name="log_id" id="return_log_id"><div class="mb-2"><label>تاريخ العودة الفعلي</label><input type="date" name="actual_return_date" class="form-control" required value="{{ now.strftime('%Y-%m-%d') }}"></div><div class="mb-2"><label>تكلفة الإصلاح (دج)</label><input type="number" name="repair_cost" class="form-control" step="0.01" value="0"></div><div class="mb-2"><label>ملاحظات</label><textarea name="notes" class="form-control" rows="2"></textarea></div></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">إلغاء</button><button type="submit" class="btn btn-primary">تسجيل العودة</button></div></form></div></div></div>
 <div class="modal fade" id="editEquipmentModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>تعديل المعدة</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" id="editEquipmentForm"><div class="modal-body"><input type="hidden" name="equipment_id" id="edit_equipment_id"><div class="mb-2"><label>اسم المعدة</label><input type="text" name="item_name" id="edit_item_name" class="form-control" required></div><div class="mb-2"><label>النوع</label><input type="text" name="item_type" id="edit_item_type" class="form-control" required></div><div class="mb-2"><label>رقم الجرد</label><input type="text" name="inventory_num" id="edit_inventory_num" class="form-control" required></div><div class="mb-2"><label>الموظف المكلف</label><input type="text" name="assigned_to" id="edit_assigned_to" class="form-control" required></div></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">إلغاء</button><button type="submit" class="btn btn-primary">حفظ</button></div></form></div></div></div>
 <script>
@@ -677,18 +881,6 @@ document.getElementById('selectAllMulti')?.addEventListener('change',function(e)
 <div class="toast-container"></div>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body></html>
-'''
-
-COMPLETED_MAINTENANCE_PRINT_HTML = '''
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head><meta charset="UTF-8"><title>تقرير الصيانة المكتملة</title>
-<style>body{font-family:Tahoma;padding:20px;direction:rtl;}h3,h4{text-align:center;}table{width:100%;border-collapse:collapse;margin-top:20px;}th,td{border:1px solid #000;padding:8px;text-align:center;}.footer{margin-top:30px;text-align:center;}.year-select{text-align:center;margin-bottom:20px;}@media print{.no-print{display:none;}}</style></head>
-<body><div class="no-print" style="margin-bottom:20px;"><button onclick="window.print()">طباعة</button> | 
-<select id="yearSelect" onchange="window.location.href='/print_completed_maintenance/{{ username }}?year='+this.value"><option value="{{ current_year }}">{{ current_year }}</option>{% for y in years %}<option value="{{ y }}">{{ y }}</option>{% endfor %}</select></div>
-<h3>مديرية التشغيل لولاية تيبازة</h3>
-<h4>تقرير الصيانة المكتملة للسنة {{ current_year }}</h4>
-<table border="1"><thead><tr><th>#</th><th>المادة</th><th>رقم الجرد</th><th>تاريخ الإرسال</th><th>تاريخ العودة</th><th>المصلح</th><th>العطل</th><th>التكلفة (دج)</th></tr></thead><tbody>{% for log in logs %}<tr><td style="text-align:center">{{ loop.index }}</td><td style="text-align:center">{{ log.item_name }}</td><td style="text-align:center">{{ log.inventory_num }}</td><td style="text-align:center">{{ log.sent_date }}</td><td style="text-align:center">{{ log.actual_return_date }}</td><td style="text-align:center">{{ log.repair_shop }}</td><td style="text-align:center">{{ log.issue_description }}</td><td style="text-align:center">{{ log.repair_cost }}</td></tr>{% endfor %}</tbody></table><div class="footer">تم الإنشاء في {{ now }}</div></body></html>
 '''
 
 LOGS_HTML = '''
@@ -741,7 +933,7 @@ PRINT_HTML = '''
 </style>
 </head>
 <body><button class="no-print" onclick="window.print()" style="margin:10px;padding:5px 10px;">Imprimer</button>
-<div class="container"><div class="header"><div>RÉPUBLIQUE ALGÉRIENNE DÉMOCRATIQUE ET POPULAIRE</div><div>MINISTÈRE DU TRAVAIL DE L’EMPLOI ET DE LA SÉCURITÉ SOCIALE</div><div>DIRECTION DE L’EMPLOI DE LA WILAYA TIPAZA</div><div>SERVICE DE L’ADMINISTRATION ET BUDGET</div></div>
+<div class="container"><div class="header"><div>RÉPUBLIQUE ALGÉRIENNE DÉMOCRATIQUE ET POPULAIRE</div><div>MINISTÈRE DU TRAVAIL DE L'EMPLOI ET DE LA SÉCURITÉ SOCIALE</div><div>DIRECTION DE L'EMPLOI DE LA WILAYA TIPAZA</div><div>SERVICE DE L'ADMINISTRATION ET BUDGET</div></div>
 <div class="decharge-title">DÉCHARGE N° {{ decharge_number }}</div>
 <div class="info-row"><span class="info-label">Nom et prénom: </span>{{ receiver_name }}</div>
 <div class="info-row"><span class="info-label">Grade / État: </span>{{ receiver_grade }}</div>
@@ -810,11 +1002,7 @@ PURCHASES_HTML = '''
 <div class="container mt-4"><div class="card p-4 mb-4"><h5>➕ إضافة عملية شراء جديدة</h5><form method="POST" action="/add_purchase/{{ username }}"><div class="row g-2"><div class="col-md-3"><label>المورد</label><select name="supplier_id" class="form-select" required><option value="">اختر المورد...</option>{% for sup in suppliers %}<option value="{{ sup.id }}">{{ sup.name }}</option>{% endfor %}</select></div><div class="col-md-2"><label>التاريخ</label><input type="date" name="purchase_date" class="form-control" value="{{ now }}" required></div><div class="col-md-3"><label>اسم المادة</label><input type="text" name="item_name" class="form-control" required></div><div class="col-md-1"><label>الكمية</label><input type="number" name="quantity" step="0.01" class="form-control" required></div><div class="col-md-1"><label>سعر الوحدة</label><input type="number" name="unit_price" step="0.01" class="form-control" required></div><div class="col-md-2"><label>ملاحظات</label><input type="text" name="notes" class="form-control"></div><div class="col-md-12 mt-2"><button type="submit" class="btn btn-primary">تسجيل الشراء</button></div></div></form></div>
 <div class="card p-4 mb-4"><h5>💰 تسجيل دفعة (سداد)</h5><form method="POST" action="/add_payment/{{ username }}"><div class="row g-2"><div class="col-md-3"><label>المورد</label><select name="supplier_id" class="form-select" required><option value="">اختر المورد...</option>{% for sup in suppliers %}<option value="{{ sup.id }}">{{ sup.name }}</option>{% endfor %}</select></div><div class="col-md-2"><label>تاريخ الدفع</label><input type="date" name="payment_date" class="form-control" value="{{ now }}" required></div><div class="col-md-2"><label>المبلغ (دج)</label><input type="number" name="amount" step="0.01" class="form-control" required></div><div class="col-md-3"><label>طريقة الدفع</label><select name="payment_method" class="form-select"><option>نقدي</option><option>شيك</option><option>تحويل بنكي</option></select></div><div class="col-md-2"><label>ملاحظات</label><input type="text" name="notes" class="form-control"></div><div class="col-md-12 mt-2"><button type="submit" class="btn btn-success">تسجيل الدفعة</button></div></div></form></div>
 <div class="card p-4 mb-4"><div class="d-flex justify-content-between align-items-center mb-3"><h5>🏢 الموردين والرصيد الحالي</h5><button class="btn btn-sm btn-primary" onclick="showAddSupplierModal()">➕ إضافة مورد جديد</button></div><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>المورد</th><th>إجمالي المشتريات</th><th>إجمالي المدفوعات</th><th>الرصيد (دج)</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>{% for sup in suppliers %}<tr><td class="align-middle">{{ sup.name }}</td><td class="align-middle">{{ sup.total_purchases|round(2) }}</td><td class="align-middle">{{ sup.total_payments|round(2) }}</td><td class="align-middle fw-bold {% if sup.balance > 0 %}text-danger{% elif sup.balance < 0 %}text-success{% endif %}">{% if sup.balance > 0 %}+{% elif sup.balance < 0 %}-{% endif %}{{ sup.balance|round(2) }}</td><td class="align-middle">{% if sup.balance > 0 %}<span class="badge bg-danger">علينا (مدين)</span>{% elif sup.balance < 0 %}<span class="badge bg-success">لهم (دائن)</span>{% else %}<span class="badge bg-secondary">متساوية</span>{% endif %}</td><td class="align-middle"><button class="btn btn-sm btn-info" onclick="showDetails({{ sup.id }}, '{{ sup.name }}')">تفاصيل</button><a href="/supplier_transactions/{{ sup.id }}/{{ username }}" class="btn btn-sm btn-secondary">كشف الحساب</a><button class="btn btn-sm btn-warning" onclick="editSupplier({{ sup.id }}, '{{ sup.name }}', '{{ sup.contact or '' }}', '{{ sup.address or '' }}')">تعديل</button><button class="btn btn-sm btn-danger" onclick="deleteSupplier({{ sup.id }}, '{{ sup.name }}')">حذف</button></td></tr>{% endfor %}</tbody></table></div></div></div>
-
-<!-- Modal عرض التفاصيل -->
 <div class="modal fade" id="detailsModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5 id="modalTitle">تفاصيل المعاملات</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body" id="modalBody">...</div></div></div></div>
-
-<!-- Modal إضافة/تعديل مورد (تم إصلاحه) -->
 <div class="modal fade" id="supplierModal" tabindex="-1">
     <div class="modal-dialog">
         <div class="modal-content">
@@ -846,7 +1034,6 @@ PURCHASES_HTML = '''
         </div>
     </div>
 </div>
-
 <script>
 function showDetails(supplierId,name){document.getElementById('modalTitle').innerText='تفاصيل المعاملات - '+name;fetch('/supplier_details/'+supplierId).then(r=>r.json()).then(data=>{let html='<h6>المشتريات</h6><ul>';data.purchases.forEach(p=>{html+=`<li>${p.date} - ${p.item_name} (${p.quantity} × ${p.unit_price}) = ${p.total_price} دج</li>`;});html+='</ul><h6>المدفوعات</h6><ul>';data.payments.forEach(p=>{html+=`<li>${p.date} - ${p.amount} دج (${p.method})</li>`;});html+='</ul>';document.getElementById('modalBody').innerHTML=html;bootstrap.Modal.getOrCreateInstance(document.getElementById('detailsModal')).show();});}
 function showAddSupplierModal(){
@@ -896,15 +1083,15 @@ SUPPLIER_TRANSACTIONS_HTML = '''
         <tbody>
             {% for p in purchases %}
             <tr>
-                <td class="text-nowrap align-middle">{{ p.purchase_date }}</td>
-                <td class="align-middle">{{ p.item_name }}</td>
-                <td class="align-middle">{{ p.quantity }}</td>
-                <td class="align-middle">{{ p.unit_price }}</td>
-                <td class="align-middle">{{ p.total_price }}</td>
-                <td class="align-middle">{{ p.notes or '' }}</td>
+                <td class="text-nowrap align-middle">{{ p[2] }}</td>
+                <td class="align-middle">{{ p[3] }}</td>
+                <td class="align-middle">{{ p[4] }}</td>
+                <td class="align-middle">{{ p[5] }}</td>
+                <td class="align-middle">{{ p[6] }}</td>
+                <td class="align-middle">{{ p[7] or '' }}</td>
                 <td class="align-middle no-print">
-                    <button class="btn btn-sm btn-warning" onclick="editPurchase({{ p.id }}, '{{ p.item_name }}', {{ p.quantity }}, {{ p.unit_price }}, '{{ p.purchase_date }}', '{{ p.notes or '' }}')">تعديل</button>
-                    <a href="/delete_purchase/{{ p.id }}/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف عملية الشراء؟')">حذف</a>
+                    <button class="btn btn-sm btn-warning" onclick="editPurchase({{ p[0] }}, '{{ p[3] }}', {{ p[4] }}, {{ p[5] }}, '{{ p[2] }}', '{{ p[7] or '' }}')">تعديل</button>
+                    <a href="/delete_purchase/{{ p[0] }}/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف عملية الشراء؟')">حذف</a>
                 </td>
             </tr>
             {% else %}
@@ -931,13 +1118,13 @@ SUPPLIER_TRANSACTIONS_HTML = '''
         <tbody>
             {% for pay in payments %}
             <tr>
-                <td class="text-nowrap align-middle">{{ pay.payment_date }}</td>
-                <td class="align-middle">{{ pay.amount }}</td>
-                <td class="align-middle">{{ pay.payment_method }}</td>
-                <td class="align-middle">{{ pay.notes or '' }}</td>
+                <td class="text-nowrap align-middle">{{ pay[2] }}</td>
+                <td class="align-middle">{{ pay[3] }}</td>
+                <td class="align-middle">{{ pay[4] }}</td>
+                <td class="align-middle">{{ pay[5] or '' }}</td>
                 <td class="align-middle no-print">
-                    <button class="btn btn-sm btn-warning" onclick="editPayment({{ pay.id }}, {{ pay.amount }}, '{{ pay.payment_date }}', '{{ pay.payment_method }}', '{{ pay.notes or '' }}')">تعديل</button>
-                    <a href="/delete_payment/{{ pay.id }}/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف الدفعة؟')">حذف</a>
+                    <button class="btn btn-sm btn-warning" onclick="editPayment({{ pay[0] }}, {{ pay[3] }}, '{{ pay[2] }}', '{{ pay[4] }}', '{{ pay[5] or '' }}')">تعديل</button>
+                    <a href="/delete_payment/{{ pay[0] }}/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف الدفعة؟')">حذف</a>
                 </td>
             </tr>
             {% else %}
@@ -952,10 +1139,8 @@ SUPPLIER_TRANSACTIONS_HTML = '''
 <div class="mt-3 print-balance"><strong>إجمالي المشتريات:</strong> {{ total_purchases }} دج &nbsp;|&nbsp;<strong>إجمالي المدفوعات:</strong> {{ total_payments }} دج &nbsp;|&nbsp;<strong>الرصيد المتبقي:</strong> <span class="{% if balance > 0 %}balance-positive{% elif balance < 0 %}balance-negative{% endif %}">{% if balance > 0 %}+{% elif balance < 0 %}-{% endif %}{{ balance }} دج</span> ({% if balance > 0 %}علينا (مدين){% elif balance < 0 %}لهم (دائن){% else %}متساوية{% endif %})</div>
 </div></div>
 
-<!-- Modal تعديل الشراء -->
 <div class="modal fade" id="editPurchaseModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>تعديل الشراء</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" id="editPurchaseForm"><div class="modal-body"><input type="hidden" name="purchase_id" id="edit_purchase_id"><div class="mb-2"><label>التاريخ</label><input type="date" name="purchase_date" id="edit_purchase_date" class="form-control" required></div><div class="mb-2"><label>اسم المادة</label><input type="text" name="item_name" id="edit_item_name" class="form-control" required></div><div class="mb-2"><label>الكمية</label><input type="number" name="quantity" id="edit_quantity" step="0.01" class="form-control" required></div><div class="mb-2"><label>سعر الوحدة</label><input type="number" name="unit_price" id="edit_unit_price" step="0.01" class="form-control" required></div><div class="mb-2"><label>ملاحظات</label><input type="text" name="notes" id="edit_notes" class="form-control"></div></div><div class="modal-footer"><button type="submit" class="btn btn-primary">حفظ</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">إلغاء</button></div></form></div></div></div>
 
-<!-- Modal تعديل الدفعة -->
 <div class="modal fade" id="editPaymentModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>تعديل الدفعة</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" id="editPaymentForm"><div class="modal-body"><input type="hidden" name="payment_id" id="edit_payment_id"><div class="mb-2"><label>التاريخ</label><input type="date" name="payment_date" id="edit_payment_date" class="form-control" required></div><div class="mb-2"><label>المبلغ</label><input type="number" name="amount" id="edit_amount" step="0.01" class="form-control" required></div><div class="mb-2"><label>طريقة الدفع</label><select name="payment_method" id="edit_payment_method" class="form-select"><option>نقدي</option><option>شيك</option><option>تحويل بنكي</option></select></div><div class="mb-2"><label>ملاحظات</label><input type="text" name="notes" id="edit_payment_notes" class="form-control"></div></div><div class="modal-footer"><button type="submit" class="btn btn-primary">حفظ</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">إلغاء</button></div></form></div></div></div>
 
 <script>
@@ -973,7 +1158,7 @@ MANAGE_USERS_HTML = '''
 <nav class="navbar navbar-custom"><div class="container"><span class="navbar-brand">إدارة المستخدمين</span><div><a href="/dashboard/{{ username }}" class="btn btn-outline-light btn-sm">الرئيسية</a></div></div></nav>
 <div class="container mt-4"><div class="card p-4 mb-4"><h5>تغيير كلمة المرور الخاصة بي</h5><form method="POST" action="/change_password/{{ username }}"><div class="row"><div class="col-md-4"><label>كلمة المرور الحالية</label><input type="password" name="old_password" class="form-control" required></div><div class="col-md-4"><label>كلمة المرور الجديدة</label><input type="password" name="new_password" class="form-control" required></div><div class="col-md-4"><button type="submit" class="btn btn-warning mt-4">تغيير كلمة المرور</button></div></div></form></div>
 {% if session.role == 'مدير' %}<div class="card p-4"><h5>إضافة مستخدم جديد</h5><form method="POST" action="/add_user/{{ username }}"><div class="row g-2"><div class="col-md-3"><label>اسم المستخدم</label><input type="text" name="username" class="form-control" required></div><div class="col-md-3"><label>كلمة المرور</label><input type="password" name="password" class="form-control" required></div><div class="col-md-3"><label>الدور</label><select name="role" class="form-select"><option>موظف</option><option>مشرف</option><option>مدير</option></select></div><div class="col-md-3"><label>الاسم الكامل</label><input type="text" name="full_name" class="form-control"></div><div class="col-md-12"><button type="submit" class="btn btn-primary">إضافة مستخدم</button></div></div></form></div>
-<div class="card p-4 mt-4"><h5>قائمة المستخدمين</h5><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>اسم المستخدم</th><th>الدور</th><th>الاسم الكامل</th><th>إجراءات</th></tr></thead><tbody>{% for u in users %}<td><td class="align-middle">{{ u.username }}</td><td class="align-middle">{{ u.role }}</td><td class="align-middle">{{ u.full_name or '' }}</td><td class="align-middle"><button class="btn btn-sm btn-warning" onclick="editUser('{{ u.username }}', '{{ u.role }}', '{{ u.full_name or '' }}')">تعديل</button>{% if u.username != 'admin' %}<a href="/delete_user/{{ u.username }}/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف مستخدم؟')">حذف</a>{% endif %}</td></tr>{% endfor %}</tbody></table></div></div>{% endif %}</div>
+<div class="card p-4 mt-4"><h5>قائمة المستخدمين</h5><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>اسم المستخدم</th><th>الدور</th><th>الاسم الكامل</th><th>إجراءات</th></tr></thead><tbody>{% for u in users %}<tr><td class="align-middle">{{ u[0] }}</td><td class="align-middle">{{ u[2] }}</td><td class="align-middle">{{ u[4] or '' }}</td><td class="align-middle"><button class="btn btn-sm btn-warning" onclick="editUser('{{ u[0] }}', '{{ u[2] }}', '{{ u[4] or '' }}')">تعديل</button>{% if u[0] != 'admin' %}<a href="/delete_user/{{ u[0] }}/{{ username }}" class="btn btn-sm btn-danger" onclick="return confirm('حذف مستخدم؟')">حذف</a>{% endif %}</td></tr>{% endfor %}</tbody></table></div></div>{% endif %}</div>
 <div class="modal fade" id="editUserModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>تعديل المستخدم</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" id="editUserForm"><div class="modal-body"><input type="hidden" name="username" id="edit_username"><div class="mb-2"><label>الدور</label><select name="role" id="edit_role" class="form-select"><option>موظف</option><option>مشرف</option><option>مدير</option></select></div><div class="mb-2"><label>الاسم الكامل</label><input type="text" name="full_name" id="edit_full_name" class="form-control"></div><div class="mb-2"><label>كلمة المرور الجديدة (اتركها فارغة لعدم التغيير)</label><input type="password" name="new_password" class="form-control"></div></div><div class="modal-footer"><button type="submit" class="btn btn-primary">حفظ</button></div></form></div></div></div>
 <script>
 function editUser(username,role,full_name){document.getElementById('edit_username').value=username;document.getElementById('edit_role').value=role;document.getElementById('edit_full_name').value=full_name;document.getElementById('editUserForm').action="/edit_user/{{ username }}";bootstrap.Modal.getOrCreateInstance(document.getElementById('editUserModal')).show();}
@@ -991,10 +1176,14 @@ def login():
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
+        if not conn:
+            flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+            return render_template_string(LOGIN_HTML)
         cur = conn.cursor()
-        cur.execute("SELECT username, password, role, theme FROM users WHERE username=?", (username,))
+        cur.execute("SELECT username, password, role, theme FROM users WHERE username=%s", (username,))
         user = cur.fetchone()
+        cur.close()
         conn.close()
         if user and user[1] == hash_password(password):
             session['username'] = user[0]
@@ -1015,11 +1204,14 @@ def logout():
 def set_theme():
     if 'username' in session:
         theme = request.json.get('theme', 'light')
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("UPDATE users SET theme=? WHERE username=?", (theme, session['username']))
-        conn.commit()
-        conn.close()
-        session['theme'] = theme
+        conn = get_db_connection()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET theme=%s WHERE username=%s", (theme, session['username']))
+            conn.commit()
+            cur.close()
+            conn.close()
+            session['theme'] = theme
     return '', 204
 
 @app.route('/dashboard/<username>')
@@ -1034,18 +1226,25 @@ def dashboard(username):
 def section(slug, username):
     if 'username' not in session or session['username'] != username:
         return redirect(url_for('login'))
+    
     if slug == 'general_inv':
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
+        conn = get_db_connection()
+        if not conn:
+            flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+            return redirect(url_for('dashboard', username=username))
         cur = conn.cursor()
         cur.execute("SELECT * FROM general_inventory ORDER BY id DESC")
         items = cur.fetchall()
         next_num = get_next_ordre_num()
+        cur.close()
         conn.close()
         return render_template_string(GENERAL_INV_HTML, username=username, items=items, next_num=next_num)
+    
     elif slug == 'maintenance':
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
+        conn = get_db_connection()
+        if not conn:
+            flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+            return redirect(url_for('dashboard', username=username))
         cur = conn.cursor()
         cur.execute("SELECT * FROM maintenance_equipment ORDER BY id DESC")
         equipment = cur.fetchall()
@@ -1053,32 +1252,42 @@ def section(slug, username):
         ongoing = cur.fetchall()
         cur.execute("SELECT * FROM maintenance_logs WHERE status='returned' ORDER BY id DESC LIMIT 50")
         completed = cur.fetchall()
+        cur.close()
         conn.close()
         return render_template_string(MAINTENANCE_HTML, username=username, equipment=equipment, ongoing=ongoing, completed=completed, now=datetime.now())
+    
     elif slug == 'purchases':
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
+        conn = get_db_connection()
+        if not conn:
+            flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+            return redirect(url_for('dashboard', username=username))
         cur = conn.cursor()
         cur.execute("SELECT * FROM suppliers ORDER BY id DESC")
         suppliers_raw = cur.fetchall()
         suppliers = []
         for s in suppliers_raw:
-            cur.execute("SELECT SUM(total_price) FROM purchases WHERE supplier_id=?", (s['id'],))
+            cur.execute("SELECT COALESCE(SUM(total_price), 0) FROM purchases WHERE supplier_id=%s", (s[0],))
             tot_p = cur.fetchone()[0] or 0
-            cur.execute("SELECT SUM(amount) FROM payments WHERE supplier_id=?", (s['id'],))
+            cur.execute("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE supplier_id=%s", (s[0],))
             tot_pay = cur.fetchone()[0] or 0
             balance = tot_p - tot_pay
             suppliers.append({
-                'id': s['id'], 'name': s['name'], 'contact': s['contact'], 'address': s['address'],
+                'id': s[0], 'name': s[1], 'contact': s[2] or '', 'address': s[3] or '',
                 'total_purchases': tot_p, 'total_payments': tot_pay, 'balance': balance
             })
+        cur.close()
         conn.close()
         return render_template_string(PURCHASES_HTML, username=username, suppliers=suppliers, now=datetime.now().strftime('%Y-%m-%d'))
+    
     else:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
+        if not conn:
+            flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+            return redirect(url_for('dashboard', username=username))
         cur = conn.cursor()
-        cur.execute("SELECT id, item_name, quantity, category, inventory_num, min_stock, unit, price FROM inventory WHERE category=?", (slug,))
+        cur.execute("SELECT id, item_name, quantity, category, inventory_num, min_stock, unit, price FROM inventory WHERE category=%s", (slug,))
         items = cur.fetchall()
+        cur.close()
         conn.close()
         beneficiaries = get_beneficiaries()
         cat_name = CATEGORIES.get(slug, {}).get('ar', slug)
@@ -1088,11 +1297,14 @@ def section(slug, username):
 def manage_users(username):
     if 'username' not in session or session['username'] != username:
         return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('dashboard', username=username))
     cur = conn.cursor()
-    cur.execute("SELECT username, role, full_name FROM users")
+    cur.execute("SELECT username, password, role, theme, full_name FROM users")
     users = cur.fetchall()
+    cur.close()
     conn.close()
     return render_template_string(MANAGE_USERS_HTML, username=username, users=users)
 
@@ -1102,16 +1314,20 @@ def change_password(username):
         return redirect(url_for('login'))
     old_p = request.form.get('old_password')
     new_p = request.form.get('new_password')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('manage_users', username=username))
     cur = conn.cursor()
-    cur.execute("SELECT password FROM users WHERE username=?", (username,))
+    cur.execute("SELECT password FROM users WHERE username=%s", (username,))
     row = cur.fetchone()
     if row and row[0] == hash_password(old_p):
-        cur.execute("UPDATE users SET password=? WHERE username=?", (hash_password(new_p), username))
+        cur.execute("UPDATE users SET password=%s WHERE username=%s", (hash_password(new_p), username))
         conn.commit()
         flash("تم تغيير كلمة المرور بنجاح", "success")
     else:
         flash("كلمة المرور الحالية غير صحيحة", "danger")
+    cur.close()
     conn.close()
     return redirect(url_for('manage_users', username=username))
 
@@ -1123,14 +1339,18 @@ def add_user(username):
     p = request.form.get('password')
     r = request.form.get('role')
     f = request.form.get('full_name')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('manage_users', username=username))
     cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO users (username, password, role, full_name) VALUES (?,?,?,?)", (u, hash_password(p), r, f))
+        cur.execute("INSERT INTO users (username, password, role, full_name) VALUES (%s, %s, %s, %s)", (u, hash_password(p), r, f))
         conn.commit()
         flash("تم إضافة المستخدم بنجاح", "success")
-    except sqlite3.IntegrityError:
-        flash("اسم المستخدم موجود مسبقاً", "danger")
+    except Exception as e:
+        flash(f"خطأ: {str(e)}", "danger")
+    cur.close()
     conn.close()
     return redirect(url_for('manage_users', username=username))
 
@@ -1142,13 +1362,17 @@ def edit_user(username):
     r = request.form.get('role')
     f = request.form.get('full_name')
     new_p = request.form.get('new_password')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('manage_users', username=username))
     cur = conn.cursor()
     if new_p:
-        cur.execute("UPDATE users SET role=?, full_name=?, password=? WHERE username=?", (r, f, hash_password(new_p), u))
+        cur.execute("UPDATE users SET role=%s, full_name=%s, password=%s WHERE username=%s", (r, f, hash_password(new_p), u))
     else:
-        cur.execute("UPDATE users SET role=?, full_name=? WHERE username=?", (r, f, u))
+        cur.execute("UPDATE users SET role=%s, full_name=%s WHERE username=%s", (r, f, u))
     conn.commit()
+    cur.close()
     conn.close()
     flash("تم تعديل المستخدم بنجاح", "success")
     return redirect(url_for('manage_users', username=username))
@@ -1157,20 +1381,27 @@ def edit_user(username):
 def delete_user(target_username, username):
     if 'username' not in session or session['role'] != 'مدير' or target_username == 'admin':
         return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('manage_users', username=username))
     cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE username=?", (target_username,))
+    cur.execute("DELETE FROM users WHERE username=%s", (target_username,))
     conn.commit()
+    cur.close()
     conn.close()
     flash("تم حذف المستخدم من النظام", "success")
     return redirect(url_for('manage_users', username=username))
 
 @app.route('/get_items_by_category/<slug>')
 def get_items_by_category(slug):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'items': []})
     cur = conn.cursor()
-    cur.execute("SELECT item_name FROM inventory WHERE category=?", (slug,))
+    cur.execute("SELECT item_name FROM inventory WHERE category=%s", (slug,))
     items = [r[0] for r in cur.fetchall()]
+    cur.close()
     conn.close()
     return jsonify({'items': items})
 
@@ -1184,15 +1415,20 @@ def add_item(slug, username):
     unit = request.form.get('unit') or 'قطعة'
     price = float(request.form.get('price') or 0)
     inv_num = request.form.get('inventory_num') or ''
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug=slug, username=username))
     cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO inventory (item_name, quantity, category, inventory_num, min_stock, unit, price, last_updated) VALUES (?,?,?,?,?,?,?,?)",
+        cur.execute("""INSERT INTO inventory (item_name, quantity, category, inventory_num, min_stock, unit, price, last_updated) 
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                     (name, qty, slug, inv_num, min_s, unit, price, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
         flash("تم إضافة المادة بنجاح", "success")
-    except sqlite3.IntegrityError:
-        flash("المادة موجودة مسبقاً", "danger")
+    except Exception as e:
+        flash(f"خطأ: {str(e)}", "danger")
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug=slug, username=username))
 
@@ -1207,11 +1443,16 @@ def edit_item(slug, username):
     unit = request.form.get('unit') or 'قطعة'
     price = float(request.form.get('price') or 0)
     inv_num = request.form.get('inventory_num') or ''
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug=slug, username=username))
     cur = conn.cursor()
-    cur.execute("UPDATE inventory SET item_name=?, quantity=?, min_stock=?, unit=?, price=?, inventory_num=?, last_updated=? WHERE id=?",
+    cur.execute("""UPDATE inventory SET item_name=%s, quantity=%s, min_stock=%s, unit=%s, price=%s, inventory_num=%s, last_updated=%s 
+                   WHERE id=%s""",
                 (name, qty, min_s, unit, price, inv_num, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), item_id))
     conn.commit()
+    cur.close()
     conn.close()
     flash("تم التحديث بنجاح", "success")
     return redirect(url_for('section', slug=slug, username=username))
@@ -1220,10 +1461,14 @@ def edit_item(slug, username):
 def delete_item(item_id, slug, username):
     if 'username' not in session or session['role'] != 'مدير':
         return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug=slug, username=username))
     cur = conn.cursor()
-    cur.execute("DELETE FROM inventory WHERE id=?", (item_id,))
+    cur.execute("DELETE FROM inventory WHERE id=%s", (item_id,))
     conn.commit()
+    cur.close()
     conn.close()
     flash("تم حذف المادة نهائياً من الجرد الحالي", "success")
     return redirect(url_for('section', slug=slug, username=username))
@@ -1236,10 +1481,14 @@ def add_to_cart():
     qty = int(request.form.get('quantity') or 1)
     if 'cart' not in session:
         session['cart'] = []
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug=slug, username=username))
     cur = conn.cursor()
-    cur.execute("SELECT quantity FROM inventory WHERE item_name=?", (item_name,))
+    cur.execute("SELECT quantity FROM inventory WHERE item_name=%s", (item_name,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     if row and row[0] >= qty:
         session['cart'].append({'item_name': item_name, 'quantity': qty})
@@ -1285,27 +1534,31 @@ def confirm_decharge_number(username):
     if not cart:
         flash("السلة فارغة حالياً", "danger")
         return redirect(url_for('section', slug=slug, username=username))
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug=slug, username=username))
     cur = conn.cursor()
-    cur.execute("SELECT full_name, grade, structure FROM beneficiaries WHERE id=?", (receiver_id,))
+    cur.execute("SELECT full_name, grade, structure FROM beneficiaries WHERE id=%s", (receiver_id,))
     rec_row = cur.fetchone()
     rec_name = rec_row[0] if rec_row else ''
     rec_grade = rec_row[1] if rec_row else ''
     rec_structure = rec_row[2] if rec_row else ''
     discharge_items = []
     for ci in cart:
-        cur.execute("SELECT quantity, inventory_num FROM inventory WHERE item_name=?", (ci['item_name'],))
+        cur.execute("SELECT quantity, inventory_num FROM inventory WHERE item_name=%s", (ci['item_name'],))
         inv_row = cur.fetchone()
         if inv_row and inv_row[0] >= ci['quantity']:
             new_qty = inv_row[0] - ci['quantity']
-            inv_num = inv_row[1]
-            cur.execute("UPDATE inventory SET quantity=?, last_updated=? WHERE item_name=?", 
+            inv_num = inv_row[1] if inv_row else ''
+            cur.execute("UPDATE inventory SET quantity=%s, last_updated=%s WHERE item_name=%s", 
                         (new_qty, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ci['item_name']))
             cur.execute("""INSERT INTO discharges (item_name, quantity, receiver_id, user_charged, date_time, category, inventory_num, notes, decharge_number) 
-                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                         (ci['item_name'], ci['quantity'], receiver_id, username, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), slug, inv_num, notes, decharge_num))
             discharge_items.append({'item_name': ci['item_name'], 'quantity': ci['quantity'], 'notes': notes})
     conn.commit()
+    cur.close()
     conn.close()
     session['cart'] = []
     session.modified = True
@@ -1313,11 +1566,14 @@ def confirm_decharge_number(username):
 
 @app.route('/print_discharge_by_id/<int:discharge_id>')
 def print_discharge_by_id(discharge_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return "خطأ في الاتصال بقاعدة البيانات", 500
     cur = conn.cursor()
     cur.execute("""SELECT d.decharge_number, b.full_name, b.grade, b.structure, d.date_time, d.item_name, d.quantity, d.notes 
-                   FROM discharges d LEFT JOIN beneficiaries b ON d.receiver_id = b.id WHERE d.id=?""", (discharge_id,))
+                   FROM discharges d LEFT JOIN beneficiaries b ON d.receiver_id = b.id WHERE d.id=%s""", (discharge_id,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     if row:
         item = {'item_name': row[5], 'quantity': row[6], 'notes': row[7]}
@@ -1349,15 +1605,19 @@ def logs(username):
 def delete_log(log_id, username):
     if 'username' not in session or session['role'] != 'مدير':
         return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('logs', username=username))
     cur = conn.cursor()
-    cur.execute("SELECT item_name, quantity FROM discharges WHERE id=?", (log_id,))
+    cur.execute("SELECT item_name, quantity FROM discharges WHERE id=%s", (log_id,))
     row = cur.fetchone()
     if row:
-        cur.execute("UPDATE inventory SET quantity = quantity + ? WHERE item_name=?", (row[1], row[0]))
-        cur.execute("DELETE FROM discharges WHERE id=?", (log_id,))
+        cur.execute("UPDATE inventory SET quantity = quantity + %s WHERE item_name=%s", (row[1], row[0]))
+        cur.execute("DELETE FROM discharges WHERE id=%s", (log_id,))
         conn.commit()
         flash("تم إلغاء ترحيل الوصل وإعادة السلع المدفوعة إلى المخزون الجاري", "success")
+    cur.close()
     conn.close()
     return redirect(url_for('logs', username=username))
 
@@ -1379,10 +1639,14 @@ def add_beneficiary_route(username):
 
 @app.route('/delete_beneficiary/<int:b_id>/<username>')
 def delete_beneficiary(b_id, username):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('manage_beneficiaries', username=username))
     cur = conn.cursor()
-    cur.execute("DELETE FROM beneficiaries WHERE id=?", (b_id,))
+    cur.execute("DELETE FROM beneficiaries WHERE id=%s", (b_id,))
     conn.commit()
+    cur.close()
     conn.close()
     flash("تم الحذف بنجاح", "success")
     return redirect(url_for('manage_beneficiaries', username=username))
@@ -1427,15 +1691,20 @@ def add_general_item(username):
     desig = request.form.get('designation')
     bureau = request.form.get('bureau_num')
     obs = request.form.get('observation')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='general_inv', username=username))
     cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO general_inventory (ordre_num, inventory_num, designation, bureau_num, observation, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+        cur.execute("""INSERT INTO general_inventory (ordre_num, inventory_num, designation, bureau_num, observation, created_at, updated_at) 
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                     (ord_num, inv_num, desig, bureau, obs, datetime.now().isoformat(), datetime.now().isoformat()))
         conn.commit()
         flash("تمت الإضافة بنجاح", "success")
-    except sqlite3.IntegrityError:
-        flash("رقم الجرد مسجل مسبقاً لعنصر آخر", "danger")
+    except Exception as e:
+        flash(f"خطأ: {str(e)}", "danger")
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='general_inv', username=username))
 
@@ -1446,21 +1715,30 @@ def edit_general_item(item_id, username):
     desig = request.form.get('designation')
     bureau = request.form.get('bureau_num')
     obs = request.form.get('observation')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='general_inv', username=username))
     cur = conn.cursor()
-    cur.execute("UPDATE general_inventory SET ordre_num=?, inventory_num=?, designation=?, bureau_num=?, observation=?, updated_at=? WHERE id=?",
+    cur.execute("""UPDATE general_inventory SET ordre_num=%s, inventory_num=%s, designation=%s, bureau_num=%s, observation=%s, updated_at=%s 
+                   WHERE id=%s""",
                 (ord_num, inv_num, desig, bureau, obs, datetime.now().isoformat(), item_id))
     conn.commit()
+    cur.close()
     conn.close()
     flash("تم التعديل", "success")
     return redirect(url_for('section', slug='general_inv', username=username))
 
 @app.route('/delete_general_item/<int:item_id>/<username>')
 def delete_general_item(item_id, username):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='general_inv', username=username))
     cur = conn.cursor()
-    cur.execute("DELETE FROM general_inventory WHERE id=?", (item_id,))
+    cur.execute("DELETE FROM general_inventory WHERE id=%s", (item_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='general_inv', username=username))
 
@@ -1479,15 +1757,20 @@ def add_equipment(username):
     typ = request.form.get('item_type')
     inv = request.form.get('inventory_num')
     assigned = request.form.get('assigned_to')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='maintenance', username=username))
     cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO maintenance_equipment (item_name, item_type, inventory_num, assigned_to, created_at) VALUES (?,?,?,?,?)",
+        cur.execute("""INSERT INTO maintenance_equipment (item_name, item_type, inventory_num, assigned_to, created_at) 
+                       VALUES (%s, %s, %s, %s, %s)""",
                     (name, typ, inv, assigned, datetime.now().isoformat()))
         conn.commit()
         flash("تم حفظ العتاد بنجاح", "success")
-    except sqlite3.IntegrityError:
-        flash("رقم الجرد مسجل مسبقاً!", "danger")
+    except Exception as e:
+        flash(f"خطأ: {str(e)}", "danger")
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='maintenance', username=username))
 
@@ -1497,20 +1780,28 @@ def edit_equipment(eq_id, username):
     typ = request.form.get('item_type')
     inv = request.form.get('inventory_num')
     assigned = request.form.get('assigned_to')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='maintenance', username=username))
     cur = conn.cursor()
-    cur.execute("UPDATE maintenance_equipment SET item_name=?, item_type=?, inventory_num=?, assigned_to=? WHERE id=?",
+    cur.execute("""UPDATE maintenance_equipment SET item_name=%s, item_type=%s, inventory_num=%s, assigned_to=%s WHERE id=%s""",
                 (name, typ, inv, assigned, eq_id))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='maintenance', username=username))
 
 @app.route('/delete_equipment/<int:eq_id>/<username>')
 def delete_equipment(eq_id, username):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='maintenance', username=username))
     cur = conn.cursor()
-    cur.execute("DELETE FROM maintenance_equipment WHERE id=?", (eq_id,))
+    cur.execute("DELETE FROM maintenance_equipment WHERE id=%s", (eq_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='maintenance', username=username))
 
@@ -1520,18 +1811,22 @@ def send_equipment_to_maintenance(username):
     shop = request.form.get('repair_shop')
     desc = request.form.get('issue_description')
     ret_d = request.form.get('expected_return_date')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='maintenance', username=username))
     cur = conn.cursor()
-    cur.execute("SELECT item_name, inventory_num FROM maintenance_equipment WHERE id=?", (eq_id,))
+    cur.execute("SELECT item_name, inventory_num FROM maintenance_equipment WHERE id=%s", (eq_id,))
     eq = cur.fetchone()
     if eq:
         decharge_num = get_next_decharge_number_for_maintenance()
         cur.execute("""INSERT INTO maintenance_logs (equipment_id, item_name, inventory_num, sent_date, repair_shop, issue_description, expected_return_date, status, decharge_number) 
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     (eq_id, eq[0], eq[1], datetime.now().strftime("%Y-%m-%d"), shop, desc, ret_d, 'sent', decharge_num))
-        cur.execute("UPDATE maintenance_equipment SET status='maintenance' WHERE id=?", (eq_id,))
+        cur.execute("UPDATE maintenance_equipment SET status='maintenance' WHERE id=%s", (eq_id,))
         conn.commit()
         flash("تم إرسال العتاد لورشة الصيانة الجارية بنجاح", "success")
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='maintenance', username=username))
 
@@ -1544,18 +1839,22 @@ def send_multi_equipment_to_maintenance(username):
     if not eq_ids:
         flash("الرجاء اختيار مادة واحدة على الأقل لإدراجها في الكشف المشترك", "danger")
         return redirect(url_for('section', slug='maintenance', username=username))
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='maintenance', username=username))
     cur = conn.cursor()
     decharge_num = get_next_decharge_number_for_maintenance()
     for eq_id in eq_ids:
-        cur.execute("SELECT item_name, inventory_num FROM maintenance_equipment WHERE id=?", (eq_id,))
+        cur.execute("SELECT item_name, inventory_num FROM maintenance_equipment WHERE id=%s", (eq_id,))
         eq = cur.fetchone()
         if eq:
             cur.execute("""INSERT INTO maintenance_logs (equipment_id, item_name, inventory_num, sent_date, repair_shop, issue_description, expected_return_date, status, decharge_number) 
-                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                         (eq_id, eq[0], eq[1], datetime.now().strftime("%Y-%m-%d"), shop, desc, ret_d, 'sent', decharge_num))
-            cur.execute("UPDATE maintenance_equipment SET status='maintenance' WHERE id=?", (eq_id,))
+            cur.execute("UPDATE maintenance_equipment SET status='maintenance' WHERE id=%s", (eq_id,))
     conn.commit()
+    cur.close()
     conn.close()
     flash("تم إرسال الأجهزة دفعة واحدة بموجب وصل واحد", "success")
     return redirect(url_for('section', slug='maintenance', username=username))
@@ -1565,56 +1864,73 @@ def return_equipment_from_maintenance(log_id, username):
     actual_d = request.form.get('actual_return_date')
     cost = float(request.form.get('repair_cost') or 0)
     notes = request.form.get('notes', '')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='maintenance', username=username))
     cur = conn.cursor()
-    cur.execute("SELECT equipment_id FROM maintenance_logs WHERE id=?", (log_id,))
+    cur.execute("SELECT equipment_id FROM maintenance_logs WHERE id=%s", (log_id,))
     row = cur.fetchone()
     if row:
-        cur.execute("UPDATE maintenance_logs SET actual_return_date=?, repair_cost=?, notes=?, status='returned' WHERE id=?",
+        cur.execute("""UPDATE maintenance_logs SET actual_return_date=%s, repair_cost=%s, notes=%s, status='returned' WHERE id=%s""",
                     (actual_d, cost, notes, log_id))
-        cur.execute("UPDATE maintenance_equipment SET status='available' WHERE id=?", (row[0],))
+        cur.execute("UPDATE maintenance_equipment SET status='available' WHERE id=%s", (row[0],))
         conn.commit()
         flash("تم تسجيل الاستلام النهائي للعتاد بعد الصيانة وإعادته للحالة المتاحة", "success")
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='maintenance', username=username))
 
 @app.route('/delete_maintenance_log/<int:log_id>/<status>/<username>')
 def delete_maintenance_log(log_id, status, username):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='maintenance', username=username))
     cur = conn.cursor()
     if status == 'ongoing':
-        cur.execute("SELECT equipment_id FROM maintenance_logs WHERE id=?", (log_id,))
+        cur.execute("SELECT equipment_id FROM maintenance_logs WHERE id=%s", (log_id,))
         row = cur.fetchone()
         if row:
-            cur.execute("UPDATE maintenance_equipment SET status='available' WHERE id=?", (row[0],))
-    cur.execute("DELETE FROM maintenance_logs WHERE id=?", (log_id,))
+            cur.execute("UPDATE maintenance_equipment SET status='available' WHERE id=%s", (row[0],))
+    cur.execute("DELETE FROM maintenance_logs WHERE id=%s", (log_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='maintenance', username=username))
 
 @app.route('/print_maintenance_slip/<int:log_id>/<username>')
 def print_maintenance_slip(log_id, username):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
+    if not conn:
+        return "خطأ في الاتصال بقاعدة البيانات", 500
     cur = conn.cursor()
-    cur.execute("SELECT * FROM maintenance_logs WHERE id=?", (log_id,))
+    cur.execute("SELECT * FROM maintenance_logs WHERE id=%s", (log_id,))
     log = cur.fetchone()
+    cur.close()
     conn.close()
     if log:
-        items = [{'item_name': log['item_name'], 'inventory_num': log['inventory_num']}]
-        return render_template_string(MAINTENANCE_DECHARGE_PRINT_HTML, decharge_number=log['decharge_number'], decharge_date=log['sent_date'], repair_shop=log['repair_shop'], items=items, issue_description=log['issue_description'])
+        items = [{'item_name': log[2], 'inventory_num': log[3]}]
+        return render_template_string(MAINTENANCE_DECHARGE_PRINT_HTML, 
+                                      decharge_number=log[12], decharge_date=log[4], 
+                                      repair_shop=log[5], items=items, issue_description=log[6])
     return "غير موجود", 404
 
 @app.route('/maintenance_decharge_form/<int:log_id>/<username>')
 def maintenance_decharge_form(log_id, username):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
+    if not conn:
+        return "خطأ في الاتصال بقاعدة البيانات", 500
     cur = conn.cursor()
-    cur.execute("SELECT * FROM maintenance_logs WHERE id=?", (log_id,))
+    cur.execute("SELECT * FROM maintenance_logs WHERE id=%s", (log_id,))
     log = cur.fetchone()
+    cur.close()
     conn.close()
     if log:
-        return render_template_string(MAINTENANCE_DECHARGE_FORM_HTML, log_id=log_id, username=username, decharge_number=log['decharge_number'], decharge_date=log['sent_date'], repair_shop=log['repair_shop'], issue_description=log['issue_description'], item_name=log['item_name'], inventory_num=log['inventory_num'])
+        return render_template_string(MAINTENANCE_DECHARGE_FORM_HTML, log_id=log_id, username=username,
+                                      decharge_number=log[12], decharge_date=log[4], 
+                                      repair_shop=log[5], issue_description=log[6],
+                                      item_name=log[2], inventory_num=log[3])
     return "غير موجود", 404
 
 @app.route('/print_maintenance_decharge/<int:log_id>/<username>', methods=['POST'])
@@ -1637,7 +1953,6 @@ def print_completed_maintenance(username):
     years = [datetime.now().year - i for i in range(5)]
     return render_template_string(COMPLETED_MAINTENANCE_PRINT_HTML, username=username, current_year=year, logs=logs, years=years, now=datetime.now().strftime("%Y-%m-%d %H:%M"))
 
-# Purchases routes
 @app.route('/add_purchase/<username>', methods=['POST'])
 def add_purchase(username):
     sup_id = request.form.get('supplier_id')
@@ -1647,12 +1962,16 @@ def add_purchase(username):
     price = float(request.form.get('unit_price') or 0)
     notes = request.form.get('notes', '')
     tot = qty * price
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='purchases', username=username))
     cur = conn.cursor()
     cur.execute("""INSERT INTO purchases (supplier_id, purchase_date, item_name, quantity, unit_price, total_price, notes, created_at, updated_at) 
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (sup_id, p_date, name, qty, price, tot, notes, datetime.now().isoformat(), datetime.now().isoformat()))
     conn.commit()
+    cur.close()
     conn.close()
     flash("تم قيد الفاتورة بنجاح وتحديث حساب المستحقات للمورد", "success")
     return redirect(url_for('section', slug='purchases', username=username))
@@ -1664,12 +1983,16 @@ def add_payment(username):
     amount = float(request.form.get('amount') or 0)
     method = request.form.get('payment_method')
     notes = request.form.get('notes', '')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='purchases', username=username))
     cur = conn.cursor()
     cur.execute("""INSERT INTO payments (supplier_id, payment_date, amount, payment_method, notes, created_at) 
-                   VALUES (?,?,?,?,?,?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
                 (sup_id, p_date, amount, method, notes, datetime.now().isoformat()))
     conn.commit()
+    cur.close()
     conn.close()
     flash("تم تسجيل عملية الدفع والسداد بنجاح", "success")
     return redirect(url_for('section', slug='purchases', username=username))
@@ -1679,10 +2002,14 @@ def add_supplier(username):
     name = request.form.get('name')
     contact = request.form.get('contact', '')
     address = request.form.get('address', '')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='purchases', username=username))
     cur = conn.cursor()
-    cur.execute("INSERT INTO suppliers (name, contact, address, created_at) VALUES (?,?,?,?)", (name, contact, address, datetime.now().isoformat()))
+    cur.execute("INSERT INTO suppliers (name, contact, address, created_at) VALUES (%s, %s, %s, %s)", (name, contact, address, datetime.now().isoformat()))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='purchases', username=username))
 
@@ -1692,54 +2019,69 @@ def edit_supplier(username):
     name = request.form.get('name')
     contact = request.form.get('contact', '')
     address = request.form.get('address', '')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='purchases', username=username))
     cur = conn.cursor()
-    cur.execute("UPDATE suppliers SET name=?, contact=?, address=? WHERE id=?", (name, contact, address, sup_id))
+    cur.execute("UPDATE suppliers SET name=%s, contact=%s, address=%s WHERE id=%s", (name, contact, address, sup_id))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='purchases', username=username))
 
 @app.route('/delete_supplier/<int:sup_id>/<username>')
 def delete_supplier(sup_id, username):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='purchases', username=username))
     cur = conn.cursor()
-    cur.execute("DELETE FROM purchases WHERE supplier_id=?", (sup_id,))
-    cur.execute("DELETE FROM payments WHERE supplier_id=?", (sup_id,))
-    cur.execute("DELETE FROM suppliers WHERE id=?", (sup_id,))
+    cur.execute("DELETE FROM purchases WHERE supplier_id=%s", (sup_id,))
+    cur.execute("DELETE FROM payments WHERE supplier_id=%s", (sup_id,))
+    cur.execute("DELETE FROM suppliers WHERE id=%s", (sup_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('section', slug='purchases', username=username))
 
 @app.route('/supplier_details/<int:supplier_id>')
 def supplier_details(supplier_id):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'purchases': [], 'payments': []})
     cur = conn.cursor()
-    cur.execute("SELECT purchase_date as date, item_name, quantity, unit_price, total_price FROM purchases WHERE supplier_id=?", (supplier_id,))
-    purchases = [dict(r) for r in cur.fetchall()]
-    cur.execute("SELECT payment_date as date, amount, payment_method as method FROM payments WHERE supplier_id=?", (supplier_id,))
-    payments = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT purchase_date as date, item_name, quantity, unit_price, total_price FROM purchases WHERE supplier_id=%s", (supplier_id,))
+    purchases = cur.fetchall()
+    cur.execute("SELECT payment_date as date, amount, payment_method as method FROM payments WHERE supplier_id=%s", (supplier_id,))
+    payments = cur.fetchall()
+    cur.close()
     conn.close()
-    return jsonify({'purchases': purchases, 'payments': payments})
+    purchases_list = [{'date': p[0], 'item_name': p[1], 'quantity': p[2], 'unit_price': p[3], 'total_price': p[4]} for p in purchases]
+    payments_list = [{'date': p[0], 'amount': p[1], 'method': p[2]} for p in payments]
+    return jsonify({'purchases': purchases_list, 'payments': payments_list})
 
 @app.route('/supplier_transactions/<int:supplier_id>/<username>')
 def supplier_transactions(supplier_id, username):
     if 'username' not in session or session['username'] != username:
         return redirect(url_for('login'))
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='purchases', username=username))
     cur = conn.cursor()
-    cur.execute("SELECT * FROM suppliers WHERE id=?", (supplier_id,))
+    cur.execute("SELECT * FROM suppliers WHERE id=%s", (supplier_id,))
     supplier = cur.fetchone()
-    cur.execute("SELECT * FROM purchases WHERE supplier_id=? ORDER BY purchase_date DESC", (supplier_id,))
+    cur.execute("SELECT * FROM purchases WHERE supplier_id=%s ORDER BY purchase_date DESC", (supplier_id,))
     purchases = cur.fetchall()
-    cur.execute("SELECT * FROM payments WHERE supplier_id=? ORDER BY payment_date DESC", (supplier_id,))
+    cur.execute("SELECT * FROM payments WHERE supplier_id=%s ORDER BY payment_date DESC", (supplier_id,))
     payments = cur.fetchall()
-    cur.execute("SELECT SUM(total_price) FROM purchases WHERE supplier_id=?", (supplier_id,))
+    cur.execute("SELECT COALESCE(SUM(total_price), 0) FROM purchases WHERE supplier_id=%s", (supplier_id,))
     tot_p = cur.fetchone()[0] or 0
-    cur.execute("SELECT SUM(amount) FROM payments WHERE supplier_id=?", (supplier_id,))
+    cur.execute("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE supplier_id=%s", (supplier_id,))
     tot_pay = cur.fetchone()[0] or 0
     balance = tot_p - tot_pay
+    cur.close()
     conn.close()
     return render_template_string(SUPPLIER_TRANSACTIONS_HTML, supplier=supplier, purchases=purchases, payments=payments, total_purchases=tot_p, total_payments=tot_pay, balance=balance, username=username)
 
@@ -1752,23 +2094,32 @@ def edit_purchase(supplier_id, username):
     price = float(request.form.get('unit_price') or 0)
     notes = request.form.get('notes', '')
     tot = qty * price
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('supplier_transactions', supplier_id=supplier_id, username=username))
     cur = conn.cursor()
-    cur.execute("UPDATE purchases SET purchase_date=?, item_name=?, quantity=?, unit_price=?, total_price=?, notes=?, updated_at=? WHERE id=?",
+    cur.execute("""UPDATE purchases SET purchase_date=%s, item_name=%s, quantity=%s, unit_price=%s, total_price=%s, notes=%s, updated_at=%s 
+                   WHERE id=%s""",
                 (p_date, name, qty, price, tot, notes, datetime.now().isoformat(), p_id))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('supplier_transactions', supplier_id=supplier_id, username=username))
 
 @app.route('/delete_purchase/<int:p_id>/<username>')
 def delete_purchase(p_id, username):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='purchases', username=username))
     cur = conn.cursor()
-    cur.execute("SELECT supplier_id FROM purchases WHERE id=?", (p_id,))
+    cur.execute("SELECT supplier_id FROM purchases WHERE id=%s", (p_id,))
     row = cur.fetchone()
     sid = row[0] if row else 1
-    cur.execute("DELETE FROM purchases WHERE id=?", (p_id,))
+    cur.execute("DELETE FROM purchases WHERE id=%s", (p_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('supplier_transactions', supplier_id=sid, username=username))
 
@@ -1779,27 +2130,34 @@ def edit_payment(supplier_id, username):
     amount = float(request.form.get('amount') or 0)
     method = request.form.get('payment_method')
     notes = request.form.get('notes', '')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('supplier_transactions', supplier_id=supplier_id, username=username))
     cur = conn.cursor()
-    cur.execute("UPDATE payments SET payment_date=?, amount=?, payment_method=?, notes=? WHERE id=?",
+    cur.execute("UPDATE payments SET payment_date=%s, amount=%s, payment_method=%s, notes=%s WHERE id=%s",
                 (p_date, amount, method, notes, pay_id))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('supplier_transactions', supplier_id=supplier_id, username=username))
 
 @app.route('/delete_payment/<int:pay_id>/<username>')
 def delete_payment(pay_id, username):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        flash("خطأ في الاتصال بقاعدة البيانات", "danger")
+        return redirect(url_for('section', slug='purchases', username=username))
     cur = conn.cursor()
-    cur.execute("SELECT supplier_id FROM payments WHERE id=?", (pay_id,))
+    cur.execute("SELECT supplier_id FROM payments WHERE id=%s", (pay_id,))
     row = cur.fetchone()
     sid = row[0] if row else 1
-    cur.execute("DELETE FROM payments WHERE id=?", (pay_id,))
+    cur.execute("DELETE FROM payments WHERE id=%s", (pay_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(url_for('supplier_transactions', supplier_id=sid, username=username))
 
-# Statistics and consumption
 @app.route('/consumption_stats')
 def consumption_stats():
     slug = request.args.get('category')
@@ -1810,24 +2168,27 @@ def consumption_stats():
     end_date = request.args.get('end_date')
     item_name = request.args.get('item_name')
     receiver = request.args.get('receiver', '')
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'html': '<p class="text-danger">خطأ في الاتصال بقاعدة البيانات</p>'})
     cur = conn.cursor()
-    q = """SELECT d.item_name, SUM(d.quantity) FROM discharges d 
-           LEFT JOIN beneficiaries b ON d.receiver_id = b.id WHERE d.category=?"""
+    q = """SELECT d.item_name, COALESCE(SUM(d.quantity), 0) FROM discharges d 
+           LEFT JOIN beneficiaries b ON d.receiver_id = b.id WHERE d.category=%s"""
     p = [slug]
     if period_type == 'year' and year:
-        q += " AND strftime('%Y', d.date_time) = ?"; p.append(str(year))
+        q += " AND d.date_time LIKE %s"; p.append(str(year) + '%')
     elif period_type == 'month' and month:
-        q += " AND strftime('%Y-%m', d.date_time) = ?"; p.append(month)
+        q += " AND d.date_time LIKE %s"; p.append(month + '%')
     elif period_type == 'custom' and start_date and end_date:
-        q += " AND date(d.date_time) BETWEEN date(?) AND date(?)"; p.extend([start_date, end_date])
+        q += " AND d.date_time::date BETWEEN %s AND %s"; p.extend([start_date, end_date])
     if item_name and item_name != 'all':
-        q += " AND d.item_name = ?"; p.append(item_name)
+        q += " AND d.item_name = %s"; p.append(item_name)
     if receiver:
-        q += " AND b.full_name LIKE ?"; p.append(f"%{receiver}%")
+        q += " AND b.full_name LIKE %s"; p.append(f"%{receiver}%")
     q += " GROUP BY d.item_name"
     cur.execute(q, p)
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     html = '<table class="table table-sm table-bordered"><thead><tr><th>المادة</th><th>إجمالي الاستهلاك</th></tr></thead><tbody>'
     for r in rows:
@@ -1841,19 +2202,22 @@ def consumption_stats():
 def purchase_needs(slug):
     current_year = datetime.now().year
     last_year = current_year - 1
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
+    if not conn:
+        return jsonify([])
     cur = conn.cursor()
-    cur.execute("SELECT item_name, unit, price FROM inventory WHERE category=?", (slug,))
+    cur.execute("SELECT item_name, unit, price FROM inventory WHERE category=%s", (slug,))
     inv_items = cur.fetchall()
     data = []
     for name, unit, price in inv_items:
-        cur.execute("SELECT SUM(quantity) FROM discharges WHERE item_name=? AND strftime('%Y', date_time)=?", (name, str(last_year)))
+        cur.execute("SELECT COALESCE(SUM(quantity), 0) FROM discharges WHERE item_name=%s AND date_time LIKE %s", (name, str(last_year) + '%'))
         last_val = cur.fetchone()[0] or 0
         suggested = int(last_val * 1.1) if last_val > 0 else 5
         data.append({
             'name': name, 'unit': unit or 'قطعة', 'price': price or 0,
             'last_year_consumption': last_val, 'suggested_quantity': suggested
         })
+    cur.close()
     conn.close()
     return jsonify(data)
 
@@ -1872,7 +2236,7 @@ def statistics(username):
     if 'username' not in session or session['username'] != username:
         return redirect(url_for('login'))
     stats = get_stats()
-    return render_template_string(STATISTICS_HTML, username=username, stats=stats, category_data=stats['category_data'], top_items_data=stats['top_items_data'])
+    return render_template_string(STATISTICS_HTML, username=username, stats=stats, category_data=stats.get('category_data', {}), top_items_data=stats.get('top_items_data', []))
 
 @app.route('/consumption_timeline')
 def consumption_timeline_route():
@@ -1880,4 +2244,5 @@ def consumption_timeline_route():
     return jsonify(data)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(debug=False, host='0.0.0.0', port=port)
