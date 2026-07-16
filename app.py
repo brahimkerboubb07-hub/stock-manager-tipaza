@@ -29,7 +29,7 @@ def get_db_url():
     database_url = os.environ.get('DATABASE_URL')
     if not database_url:
         # استخدام الرابط المحلي للتجربة
-       database_url = "postgresql://postgres:Tipaza0777600442@aws-0-eu-central-1.pooler.supabase.com:6543/tipaza_db"
+        database_url = "postgresql://postgres:Tipaza0777600442@aws-0-eu-central-1.pooler.supabase.com:6543/tipaza_db"
         print("⚠️ DATABASE_URL not set, using default Supabase URL")
     return database_url
 
@@ -881,6 +881,18 @@ document.getElementById('selectAllMulti')?.addEventListener('change',function(e)
 <div class="toast-container"></div>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body></html>
+'''
+
+COMPLETED_MAINTENANCE_PRINT_HTML = '''
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head><meta charset="UTF-8"><title>تقرير الصيانة المكتملة</title>
+<style>body{font-family:Tahoma;padding:20px;direction:rtl;}h3,h4{text-align:center;}table{width:100%;border-collapse:collapse;margin-top:20px;}th,td{border:1px solid #000;padding:8px;text-align:center;}.footer{margin-top:30px;text-align:center;}.year-select{text-align:center;margin-bottom:20px;}@media print{.no-print{display:none;}}</style></head>
+<body><div class="no-print" style="margin-bottom:20px;"><button onclick="window.print()">طباعة</button> | 
+<select id="yearSelect" onchange="window.location.href='/print_completed_maintenance/{{ username }}?year='+this.value"><option value="{{ current_year }}">{{ current_year }}</option>{% for y in years %}<option value="{{ y }}">{{ y }}</option>{% endfor %}</select></div>
+<h3>مديرية التشغيل لولاية تيبازة</h3>
+<h4>تقرير الصيانة المكتملة للسنة {{ current_year }}</h4>
+<table border="1"><thead><tr><th>#</th><th>المادة</th><th>رقم الجرد</th><th>تاريخ الإرسال</th><th>تاريخ العودة</th><th>المصلح</th><th>العطل</th><th>التكلفة (دج)</th></tr></thead><tbody>{% for log in logs %}<tr><td style="text-align:center">{{ loop.index }}</td><td style="text-align:center">{{ log[2] }}</td><td style="text-align:center">{{ log[3] }}</td><td style="text-align:center">{{ log[4] }}</td><td style="text-align:center">{{ log[7] }}</td><td style="text-align:center">{{ log[5] }}</td><td style="text-align:center">{{ log[6] }}</td><td style="text-align:center">{{ log[8] }}</td></tr>{% endfor %}</tbody></table><div class="footer">تم الإنشاء في {{ now }}</div></body></html>
 '''
 
 LOGS_HTML = '''
@@ -1944,7 +1956,12 @@ def print_maintenance_decharge(log_id, username):
     items = []
     for i in range(len(names)):
         items.append({'item_name': names[i], 'inventory_num': invs[i]})
-    return render_template_string(MAINTENANCE_DECHARGE_PRINT_HTML, decharge_number=d_num, decharge_date=d_date, repair_shop=shop, items=items, issue_description=desc)
+    return render_template_string(MAINTENANCE_DECHARGE_PRINT_HTML, 
+                                  decharge_number=d_num, 
+                                  decharge_date=d_date, 
+                                  repair_shop=shop, 
+                                  items=items, 
+                                  issue_description=desc)
 
 @app.route('/print_completed_maintenance/<username>')
 def print_completed_maintenance(username):
